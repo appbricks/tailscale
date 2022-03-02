@@ -2043,6 +2043,13 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs *ipn.Prefs, logf logger.Log
 	for _, peer := range nm.Peers {
 		set(peer.Name, peer.Addresses)
 	}
+	// *** MyCS Hook ***
+	if MyCSNodeControlService != nil {
+		for _, n := range MyCSNodeControlService.ResolvedDNSNames() {
+			set(n.Name, n.Addrs)
+		}
+	}
+	// *****************
 	for _, rec := range nm.DNS.ExtraRecords {
 		switch rec.Type {
 		case "", "A", "AAAA":

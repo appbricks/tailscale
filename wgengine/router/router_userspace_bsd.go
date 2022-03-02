@@ -145,6 +145,11 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 			// implicitly. We mustn't try to add/delete it ourselves.
 			continue
 		}
+		// *** MyCS Hook ***
+		if MyCSNodeControlService != nil && MyCSNodeControlService.ExcludeRoute(route) {
+			continue
+		}
+		// *****************
 		newRoutes[route] = struct{}{}
 	}
 	// Delete any pre-existing routes.

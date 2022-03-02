@@ -413,7 +413,16 @@ func New(collection string) *Policy {
 		// anyway, no need to add one.
 		lflags = 0
 	}
-	console := log.New(stderrWriter{}, "", lflags)
+	// **** MyCS Override ****
+	//
+	// console := log.New(stderrWriter{}, "", lflags)
+	var console *log.Logger
+	if MyCSLogOut != nil {
+		console = log.New(MyCSLogOut, "", lflags)
+	} else {
+		console = log.New(stderrWriter{}, "", lflags)
+	}
+	// ***********************
 
 	var earlyErrBuf bytes.Buffer
 	earlyLogf := func(format string, a ...interface{}) {

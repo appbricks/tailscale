@@ -173,6 +173,16 @@ func NewDirect(opts Options) (*Direct, error) {
 		// zstd compression per naclbox.
 		tr.DisableCompression = true
 		httpc = &http.Client{Transport: tr}
+
+		// *** MyCS Hook ***
+		if MyCSNodeControlService != nil {
+			if err = MyCSNodeControlService.ConfigureHTTPClient(opts.ServerURL, httpc); err != nil {
+				return nil, err
+			}
+		} else {
+			opts.Logf("NewDirect(): Skipping MyCS configuration as hook is not set.")
+		}
+		// *****************
 	}
 
 	c := &Direct{

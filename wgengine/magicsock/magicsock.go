@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"golang.zx2c4.com/go118/netip"
 	"golang.zx2c4.com/wireguard/conn"
 	"inet.af/netaddr"
 	"tailscale.com/control/controlclient"
@@ -3445,9 +3446,9 @@ func (de *endpoint) String() string {
 
 func (de *endpoint) ClearSrc()           {}
 func (de *endpoint) SrcToString() string { panic("unused") } // unused by wireguard-go
-func (de *endpoint) SrcIP() net.IP       { panic("unused") } // unused by wireguard-go
+func (de *endpoint) SrcIP() netip.Addr   { panic("unused") } // unused by wireguard-go *** MyCS Change - incompatible return w.r.t. conn.Endpoint in latest wireguard package
 func (de *endpoint) DstToString() string { return de.wgEndpoint }
-func (de *endpoint) DstIP() net.IP       { panic("unused") }
+func (de *endpoint) DstIP() netip.Addr   { panic("unused") } //  *** MyCS Change - incompatible return w.r.t. conn.Endpoint in latest wireguard package
 func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 
 // canP2P reports whether this endpoint understands the disco protocol

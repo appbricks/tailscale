@@ -558,7 +558,13 @@ func runUp(ctx context.Context, args []string) error {
 				if env.upArgs.json {
 					printUpDoneJSON(ipn.NeedsMachineAuth, "")
 				} else {
-					fmt.Fprintf(Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
+					// **** MyCS Override ****
+					if MyCSOut != nil {
+						fmt.Fprintf(MyCSOut, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
+					} else {
+						fmt.Fprintf(Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
+					}
+					// ***********************
 				}
 			case ipn.Running:
 				// Done full authentication process
@@ -566,7 +572,13 @@ func runUp(ctx context.Context, args []string) error {
 					printUpDoneJSON(ipn.Running, "")
 				} else if printed {
 					// Only need to print an update if we printed the "please click" message earlier.
-					fmt.Fprintf(Stderr, "Success.\n")
+					// **** MyCS Override ****
+					if MyCSOut != nil {
+						fmt.Fprintf(MyCSOut, "Success.\n")
+					} else {
+						fmt.Fprintf(Stderr, "Success.\n")
+					}
+					// ***********************
 				}
 				select {
 				case running <- true:
@@ -595,7 +607,13 @@ func runUp(ctx context.Context, args []string) error {
 					fmt.Println(string(data))
 				}
 			} else {
-				fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
+				// **** MyCS Override ****
+				if MyCSOut != nil {
+					fmt.Fprintf(MyCSOut, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
+				} else {
+					fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
+				}
+				// ***********************
 				if upArgs.qr {
 					q, err := qrcode.New(*url, qrcode.Medium)
 					if err != nil {
