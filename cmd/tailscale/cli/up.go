@@ -526,7 +526,7 @@ func runUp(ctx context.Context, args []string) error {
 	pumpErr := make(chan error, 1)
 	go func() { pumpErr <- pump(pumpCtx, bc, c) }()
 
-	var printed bool // whether we've yet printed anything to stdout or stderr
+	var printed bool = true // whether we've yet printed anything to stdout or stderr - *** MyCS default to true as output is captured
 	var loginOnce sync.Once
 	startLoginInteractive := func() { loginOnce.Do(func() { bc.StartLoginInteractive() }) }
 
@@ -558,13 +558,7 @@ func runUp(ctx context.Context, args []string) error {
 				if env.upArgs.json {
 					printUpDoneJSON(ipn.NeedsMachineAuth, "")
 				} else {
-					// **** MyCS Override ****
-					if MyCSOut != nil {
-						fmt.Fprintf(MyCSOut, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
-					} else {
-						fmt.Fprintf(Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
-					}
-					// ***********************
+					fmt.Fprintf(Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
 				}
 			case ipn.Running:
 				// Done full authentication process
@@ -572,13 +566,7 @@ func runUp(ctx context.Context, args []string) error {
 					printUpDoneJSON(ipn.Running, "")
 				} else if printed {
 					// Only need to print an update if we printed the "please click" message earlier.
-					// **** MyCS Override ****
-					if MyCSOut != nil {
-						fmt.Fprintf(MyCSOut, "Success.\n")
-					} else {
-						fmt.Fprintf(Stderr, "Success.\n")
-					}
-					// ***********************
+					fmt.Fprintf(Stderr, "Success.\n")
 				}
 				select {
 				case running <- true:
@@ -607,13 +595,7 @@ func runUp(ctx context.Context, args []string) error {
 					fmt.Println(string(data))
 				}
 			} else {
-				// **** MyCS Override ****
-				if MyCSOut != nil {
-					fmt.Fprintf(MyCSOut, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
-				} else {
-					fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
-				}
-				// ***********************
+				fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
 				if upArgs.qr {
 					q, err := qrcode.New(*url, qrcode.Medium)
 					if err != nil {

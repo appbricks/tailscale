@@ -2,12 +2,9 @@ package cli
 
 import (
 	"context"
-	"io"
 
 	"tailscale.com/paths"
 )
-
-var MyCSOut io.Writer
 
 func RunUp(
 	ctx context.Context, 
