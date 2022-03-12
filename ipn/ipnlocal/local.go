@@ -2093,12 +2093,18 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs *ipn.Prefs, logf logger.Log
 		}
 	}
 
+	// **** MyCS - FIX **** 
+	// do not proxy DNS via exit node as we explicitly set it for the node.
+	// TODO: this could be handled by not running such unused services on 
+	// exit node.
+	// ********************
+
 	// If we're using an exit node and that exit node is new enough (1.19.x+)
 	// to run a DoH DNS proxy, then send all our DNS traffic through it.
-	if dohURL, ok := exitNodeCanProxyDNS(nm, prefs.ExitNodeID); ok {
-		addDefault([]dnstype.Resolver{{Addr: dohURL}})
-		return dcfg
-	}
+	// if dohURL, ok := exitNodeCanProxyDNS(nm, prefs.ExitNodeID); ok {
+	// 	addDefault([]dnstype.Resolver{{Addr: dohURL}})
+	// 	return dcfg
+	// }
 
 	addDefault(nm.DNS.Resolvers)
 	for suffix, resolvers := range nm.DNS.Routes {
