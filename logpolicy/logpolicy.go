@@ -47,7 +47,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 )
 
@@ -61,9 +60,11 @@ func getLogTarget() string {
 		if val, ok := os.LookupEnv("TS_LOG_TARGET"); ok {
 			getLogTargetOnce.v = val
 		} else {
-			if runtime.GOOS == "windows" {
-				getLogTargetOnce.v = winutil.GetRegString("LogTarget", "")
-			}
+			// **** MyCS Removed Code ****
+			// if runtime.GOOS == "windows" {
+			// 	getLogTargetOnce.v = winutil.GetRegString("LogTarget", "")
+			// }
+			// ***************************
 		}
 	})
 
