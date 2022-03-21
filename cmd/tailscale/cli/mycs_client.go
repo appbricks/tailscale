@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"runtime"
 
 	"tailscale.com/paths"
 )
@@ -15,6 +16,10 @@ func RunUp(
 	rootArgs.socket = paths.DefaultTailscaledSocket()
 	upArgs.server = server
 	upArgs.forceReauth = true
+
+	if runtime.GOOS == "windows" {
+		upArgs.forceDaemon = true
+	}
 
 	for k, v := range options {
 		switch k {
