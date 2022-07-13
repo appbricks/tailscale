@@ -37,6 +37,8 @@ var (
 
 	testipv4Arpa = dnsname.FQDN("4.3.2.1.in-addr.arpa.")
 	testipv6Arpa = dnsname.FQDN("f.0.e.0.d.0.c.0.b.0.a.0.9.0.8.0.7.0.6.0.5.0.4.0.3.0.2.0.1.0.0.0.ip6.arpa.")
+
+	magicDNSv4Port = netaddr.MustParseIPPort("100.100.100.100:53")
 )
 
 var dnsCfg = Config{
@@ -231,11 +233,7 @@ func unpackResponse(payload []byte) (dnsResponse, error) {
 }
 
 func syncRespond(r *Resolver, query []byte) ([]byte, error) {
-	if err := r.EnqueueRequest(query, netaddr.IPPort{}); err != nil {
-		return nil, fmt.Errorf("EnqueueRequest: %w", err)
-	}
-	payload, _, err := r.NextResponse()
-	return payload, err
+	return r.Query(context.Background(), query, netaddr.IPPort{})
 }
 
 func mustIP(str string) netaddr.IP {
@@ -344,6 +342,13 @@ func TestResolveLocal(t *testing.T) {
 		{"mx-nxdomain", "test3.ipn.dev.", dns.TypeMX, netaddr.IP{}, dns.RCodeNameError},
 		{"ns-nxdomain", "test3.ipn.dev.", dns.TypeNS, netaddr.IP{}, dns.RCodeNameError},
 		{"onion-domain", "footest.onion.", dns.TypeA, netaddr.IP{}, dns.RCodeNameError},
+		{"magicdns", dnsSymbolicFQDN, dns.TypeA, netaddr.MustParseIP("100.100.100.100"), dns.RCodeSuccess},
+		{"via_hex", dnsname.FQDN("via-0xff.1.2.3.4."), dns.TypeAAAA, netaddr.MustParseIP("fd7a:115c:a1e0:b1a:0:ff:1.2.3.4"), dns.RCodeSuccess},
+		{"via_dec", dnsname.FQDN("via-1.10.0.0.1."), dns.TypeAAAA, netaddr.MustParseIP("fd7a:115c:a1e0:b1a:0:1:10.0.0.1"), dns.RCodeSuccess},
+		{"x_via_hex", dnsname.FQDN("4.3.2.1.via-0xff."), dns.TypeAAAA, netaddr.MustParseIP("fd7a:115c:a1e0:b1a:0:ff:4.3.2.1"), dns.RCodeSuccess},
+		{"x_via_dec", dnsname.FQDN("1.0.0.10.via-1."), dns.TypeAAAA, netaddr.MustParseIP("fd7a:115c:a1e0:b1a:0:1:1.0.0.10"), dns.RCodeSuccess},
+		{"via_invalid", dnsname.FQDN("via-."), dns.TypeAAAA, netaddr.IP{}, dns.RCodeRefused},
+		{"via_invalid_2", dnsname.FQDN("2.3.4.5.via-."), dns.TypeAAAA, netaddr.IP{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
@@ -377,6 +382,8 @@ func TestResolveLocalReverse(t *testing.T) {
 		{"ipv4_nxdomain", dnsname.FQDN("5.3.2.1.in-addr.arpa."), "", dns.RCodeNameError},
 		{"ipv6_nxdomain", dnsname.FQDN("0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.ip6.arpa."), "", dns.RCodeNameError},
 		{"nxdomain", dnsname.FQDN("2.3.4.5.in-addr.arpa."), "", dns.RCodeRefused},
+		{"magicdns", dnsname.FQDN("100.100.100.100.in-addr.arpa."), dnsSymbolicFQDN, dns.RCodeSuccess},
+		{"ipv6_4to6", dnsname.FQDN("4.6.4.6.4.6.2.6.6.9.d.c.3.4.8.4.2.1.b.a.0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa."), dnsSymbolicFQDN, dns.RCodeSuccess},
 	}
 
 	for _, tt := range tests {
@@ -454,7 +461,7 @@ func TestDelegate(t *testing.T) {
 	// intend to handle responses this large, so there should be truncation.
 	hugeTXT := generateTXT(64000, randSource)
 
-	records := []interface{}{
+	records := []any{
 		"test.site.",
 		resolveToIP(testipv4, testipv6, "dns.test.site."),
 		"LCtesT.SiTe.",
@@ -476,10 +483,10 @@ func TestDelegate(t *testing.T) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".": {
-			dnstype.Resolver{Addr: v4server.PacketConn.LocalAddr().String()},
-			dnstype.Resolver{Addr: v6server.PacketConn.LocalAddr().String()},
+			&dnstype.Resolver{Addr: v4server.PacketConn.LocalAddr().String()},
+			&dnstype.Resolver{Addr: v6server.PacketConn.LocalAddr().String()},
 		},
 	}
 	r.SetConfig(cfg)
@@ -651,7 +658,7 @@ func TestDelegateSplitRoute(t *testing.T) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".":      {{Addr: server1.PacketConn.LocalAddr().String()}},
 		"other.": {{Addr: server2.PacketConn.LocalAddr().String()}},
 	}
@@ -696,75 +703,6 @@ func TestDelegateSplitRoute(t *testing.T) {
 				t.Errorf("name = %v; want %v", response.name, tt.response.name)
 			}
 		})
-	}
-}
-
-func TestDelegateCollision(t *testing.T) {
-	server := serveDNS(t, "127.0.0.1:0",
-		"test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
-	defer server.Shutdown()
-
-	r := newResolver(t)
-	defer r.Close()
-
-	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
-		".": {{Addr: server.PacketConn.LocalAddr().String()}},
-	}
-	r.SetConfig(cfg)
-
-	packets := []struct {
-		qname dnsname.FQDN
-		qtype dns.Type
-		addr  netaddr.IPPort
-	}{
-		{"test.site.", dns.TypeA, netaddr.IPPortFrom(netaddr.IPv4(1, 1, 1, 1), 1001)},
-		{"test.site.", dns.TypeAAAA, netaddr.IPPortFrom(netaddr.IPv4(1, 1, 1, 1), 1002)},
-	}
-
-	// packets will have the same dns txid.
-	for _, p := range packets {
-		payload := dnspacket(p.qname, p.qtype, noEdns)
-		err := r.EnqueueRequest(payload, p.addr)
-		if err != nil {
-			t.Error(err)
-		}
-	}
-
-	// Despite the txid collision, the answer(s) should still match the query.
-	resp, addr, err := r.NextResponse()
-	if err != nil {
-		t.Error(err)
-	}
-
-	var p dns.Parser
-	_, err = p.Start(resp)
-	if err != nil {
-		t.Error(err)
-	}
-	err = p.SkipAllQuestions()
-	if err != nil {
-		t.Error(err)
-	}
-	ans, err := p.AllAnswers()
-	if err != nil {
-		t.Error(err)
-	}
-
-	var wantType dns.Type
-	switch ans[0].Body.(type) {
-	case *dns.AResource:
-		wantType = dns.TypeA
-	case *dns.AAAAResource:
-		wantType = dns.TypeAAAA
-	default:
-		t.Errorf("unexpected answer type: %T", ans[0].Body)
-	}
-
-	for _, p := range packets {
-		if p.qtype == wantType && p.addr != addr {
-			t.Errorf("addr = %v; want %v", addr, p.addr)
-		}
 	}
 }
 
@@ -965,8 +903,6 @@ func TestAllocs(t *testing.T) {
 	}{
 		// Name lowercasing, response slice created by dns.NewBuilder,
 		// and closure allocation from go call.
-		// (Closure allocation only happens when using new register ABI,
-		// which is amd64 with Go 1.17, and probably more platforms later.)
 		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA, noEdns), 3},
 		// 3 extra allocs in rdnsNameToIPv4 and one in marshalPTRRecord (dns.NewName).
 		{"reverse", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR, noEdns), 5},
@@ -1014,7 +950,7 @@ func BenchmarkFull(b *testing.B) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".": {{Addr: server.PacketConn.LocalAddr().String()}},
 	}
 
@@ -1066,7 +1002,7 @@ func TestForwardLinkSelection(t *testing.T) {
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	fwd := newForwarder(t.Logf, nil, nil, linkSelFunc(func(ip netaddr.IP) string {
+	fwd := newForwarder(t.Logf, nil, linkSelFunc(func(ip netaddr.IP) string {
 		if ip == netaddr.IPv4(1, 2, 3, 4) {
 			return "special"
 		}
@@ -1107,7 +1043,7 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 		t.Skip("skipping test on Windows; waiting for golang.org/issue/33097")
 	}
 
-	records := []interface{}{
+	records := []any{
 		"no-records.test.",
 		dnsHandler(),
 

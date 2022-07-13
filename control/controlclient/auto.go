@@ -7,6 +7,7 @@ package controlclient
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -60,10 +61,9 @@ type Auto struct {
 	loggedIn        bool       // true if currently logged in
 	loginGoal       *LoginGoal // non-nil if some login activity is desired
 	synced          bool       // true if our netmap is up-to-date
-	hostinfo        *tailcfg.Hostinfo
-	inPollNetMap    bool // true if currently running a PollNetMap
-	inLiteMapUpdate bool // true if a lite (non-streaming) map request is outstanding
-	inSendStatus    int  // number of sendStatus calls currently in progress
+	inPollNetMap    bool       // true if currently running a PollNetMap
+	inLiteMapUpdate bool       // true if a lite (non-streaming) map request is outstanding
+	inSendStatus    int        // number of sendStatus calls currently in progress
 	state           State
 
 	authCtx    context.Context // context used for auth requests
@@ -91,7 +91,7 @@ func NewNoStart(opts Options) (*Auto, error) {
 		return nil, err
 	}
 	if opts.Logf == nil {
-		opts.Logf = func(fmt string, args ...interface{}) {}
+		opts.Logf = func(fmt string, args ...any) {}
 	}
 	if opts.TimeNow == nil {
 		opts.TimeNow = time.Now
@@ -289,6 +289,7 @@ func (c *Auto) authRoutine() {
 		}
 
 		if goal == nil {
+			health.SetAuthRoutineInError(nil)
 			// Wait for user to Login or Logout.
 			<-ctx.Done()
 			c.logf("[v1] authRoutine: context done.")
@@ -296,6 +297,7 @@ func (c *Auto) authRoutine() {
 		}
 
 		if !goal.wantLoggedIn {
+			health.SetAuthRoutineInError(nil)
 			err := c.direct.TryLogout(ctx)
 			goal.sendLogoutError(err)
 			if err != nil {
@@ -334,6 +336,7 @@ func (c *Auto) authRoutine() {
 				f = "TryLogin"
 			}
 			if err != nil {
+				health.SetAuthRoutineInError(err)
 				report(err, f)
 				bo.BackOff(ctx, err)
 				continue
@@ -358,6 +361,7 @@ func (c *Auto) authRoutine() {
 			}
 
 			// success
+			health.SetAuthRoutineInError(nil)
 			c.mu.Lock()
 			c.loggedIn = true
 			c.loginGoal = nil
@@ -554,9 +558,8 @@ func (c *Auto) SetNetInfo(ni *tailcfg.NetInfo) {
 	if !c.direct.SetNetInfo(ni) {
 		return
 	}
-	c.logf("NetInfo: %v", ni)
 
-	// Send new Hostinfo (which includes NetInfo) to server
+	// Send new NetInfo to server
 	c.sendNewMapRequest()
 }
 
@@ -566,7 +569,6 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 	loggedIn := c.loggedIn
 	synced := c.synced
 	statusFunc := c.statusFunc
-	hi := c.hostinfo
 	c.inSendStatus++
 	c.mu.Unlock()
 
@@ -594,7 +596,6 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 		URL:            url,
 		Persist:        p,
 		NetMap:         nm,
-		Hostinfo:       hi,
 		State:          state,
 		Err:            err,
 	}
@@ -657,6 +658,10 @@ func (c *Auto) Logout(ctx context.Context) error {
 	}
 }
 
+func (c *Auto) SetExpirySooner(ctx context.Context, expiry time.Time) error {
+	return c.direct.SetExpirySooner(ctx, expiry)
+}
+
 // UpdateEndpoints sets the client's discovered endpoints and sends
 // them to the control server if they've changed.
 //
@@ -677,6 +682,7 @@ func (c *Auto) Shutdown() {
 	c.mu.Lock()
 	inSendStatus := c.inSendStatus
 	closed := c.closed
+	direct := c.direct
 	if !closed {
 		c.closed = true
 		c.statusFunc = nil
@@ -691,6 +697,9 @@ func (c *Auto) Shutdown() {
 		<-c.authDone
 		c.cancelMapUnsafely()
 		<-c.mapDone
+		if direct != nil {
+			direct.Close()
+		}
 		c.logf("Client.Shutdown done.")
 	}
 }
@@ -716,4 +725,8 @@ func (c *Auto) TestOnlyTimeNow() time.Time {
 // requesting a DNS record be created or updated.
 func (c *Auto) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) error {
 	return c.direct.SetDNS(ctx, req)
+}
+
+func (c *Auto) DoNoiseRequest(req *http.Request) (*http.Response, error) {
+	return c.direct.DoNoiseRequest(req)
 }

@@ -7,6 +7,7 @@ package cli
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,20 +19,19 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	qrcode "github.com/skip2/go-qrcode"
 	"inet.af/netaddr"
-	"tailscale.com/client/tailscale"
-	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
-	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
@@ -52,7 +52,7 @@ down").
 If flags are specified, the flags must be the complete set of desired
 settings. An error is returned if any setting would be changed as a
 result of an unspecified flag's default value, unless the --reset flag
-is also used. (The flags --authkey, --force-reauth, and --qr are not
+is also used. (The flags --auth-key, --force-reauth, and --qr are not
 considered settings that need to be re-specified when modifying
 settings.)
 `),
@@ -99,9 +99,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
 	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
-	if envknob.UseWIPCode() || inTest() {
-		upf.BoolVar(&upArgs.runSSH, "ssh", false, "run an SSH server, permitting access per tailnet admin's declared policy")
-	}
+	upf.BoolVar(&upArgs.runSSH, "ssh", false, "run an SSH server, permitting access per tailnet admin's declared policy")
 	upf.StringVar(&upArgs.advertiseTags, "advertise-tags", "", "comma-separated ACL tags to request; each must start with \"tag:\" (e.g. \"tag:eng,tag:montreal,tag:ssh\")")
 	upf.StringVar(&upArgs.authKeyOrFile, "auth-key", "", `node authorization key; if it begins with "file:", then it's a path to a file containing the authkey`)
 	upf.StringVar(&upArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
@@ -117,6 +115,8 @@ func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
 	case "windows":
 		upf.BoolVar(&upArgs.forceDaemon, "unattended", false, "run in \"Unattended Mode\" where Tailscale keeps running even after the current GUI user logs out (Windows-only)")
 	}
+	upf.DurationVar(&upArgs.timeout, "timeout", 0, "maximum amount of time to wait for tailscaled to enter a Running state; default (0s) blocks forever")
+	registerAcceptRiskFlag(upf)
 	return upf
 }
 
@@ -149,6 +149,7 @@ type upArgsT struct {
 	hostname               string
 	opUser                 string
 	json                   bool
+	timeout                time.Duration
 }
 
 func (a upArgsT) getAuthKey() (string, error) {
@@ -193,7 +194,7 @@ type upOutputJSON struct {
 	Error        string `json:",omitempty"` // description of an error
 }
 
-func warnf(format string, args ...interface{}) {
+func warnf(format string, args ...any) {
 	printf("Warning: "+format+"\n", args...)
 }
 
@@ -201,6 +202,26 @@ var (
 	ipv4default = netaddr.MustParseIPPrefix("0.0.0.0/0")
 	ipv6default = netaddr.MustParseIPPrefix("::/0")
 )
+
+func validateViaPrefix(ipp netaddr.IPPrefix) error {
+	if !tsaddr.IsViaPrefix(ipp) {
+		return fmt.Errorf("%v is not a 4-in-6 prefix", ipp)
+	}
+	if ipp.Bits() < (128 - 32) {
+		return fmt.Errorf("%v 4-in-6 prefix must be at least a /%v", ipp, 128-32)
+	}
+	a := ipp.IP().As16()
+	// The first 64 bits of a are the via prefix.
+	// The next 32 bits are the "site ID".
+	// The last 32 bits are the IPv4.
+	// For now, we reserve the top 3 bytes of the site ID,
+	// and only allow users to use site IDs 0-255.
+	siteID := binary.BigEndian.Uint32(a[8:12])
+	if siteID > 0xFF {
+		return fmt.Errorf("route %v contains invalid site ID %08x; must be 0xff or less", ipp, siteID)
+	}
+	return nil
+}
 
 func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]netaddr.IPPrefix, error) {
 	routeMap := map[netaddr.IPPrefix]bool{}
@@ -214,6 +235,11 @@ func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]
 			}
 			if ipp != ipp.Masked() {
 				return nil, fmt.Errorf("%s has non-address bits set; expected %s", ipp, ipp.Masked())
+			}
+			if tsaddr.IsViaPrefix(ipp) {
+				if err := validateViaPrefix(ipp); err != nil {
+					return nil, err
+				}
 			}
 			if ipp == ipv4default {
 				default4 = true
@@ -245,65 +271,6 @@ func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]
 	return routes, nil
 }
 
-// peerWithTailscaleIP returns the peer in st with the provided
-// Tailscale IP.
-func peerWithTailscaleIP(st *ipnstate.Status, ip netaddr.IP) (ps *ipnstate.PeerStatus, ok bool) {
-	for _, ps := range st.Peer {
-		for _, ip2 := range ps.TailscaleIPs {
-			if ip == ip2 {
-				return ps, true
-			}
-		}
-	}
-	return nil, false
-}
-
-// exitNodeIPOfArg maps from a user-provided CLI flag value to an IP
-// address they want to use as an exit node.
-func exitNodeIPOfArg(arg string, st *ipnstate.Status) (ip netaddr.IP, err error) {
-	if arg == "" {
-		return ip, errors.New("invalid use of exitNodeIPOfArg with empty string")
-	}
-	ip, err = netaddr.ParseIP(arg)
-	if err == nil {
-		// If we're online already and have a netmap, double check that the IP
-		// address specified is valid.
-		if st.BackendState == "Running" {
-			ps, ok := peerWithTailscaleIP(st, ip)
-			if !ok {
-				return ip, fmt.Errorf("no node found in netmap with IP %v", ip)
-			}
-			if !ps.ExitNodeOption {
-				return ip, fmt.Errorf("node %v is not advertising an exit node", ip)
-			}
-		}
-		return ip, err
-	}
-	match := 0
-	for _, ps := range st.Peer {
-		baseName := dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)
-		if !strings.EqualFold(arg, baseName) {
-			continue
-		}
-		match++
-		if len(ps.TailscaleIPs) == 0 {
-			return ip, fmt.Errorf("node %q has no Tailscale IP?", arg)
-		}
-		if !ps.ExitNodeOption {
-			return ip, fmt.Errorf("node %q is not advertising an exit node", arg)
-		}
-		ip = ps.TailscaleIPs[0]
-	}
-	switch match {
-	case 0:
-		return ip, fmt.Errorf("invalid value %q for --exit-node; must be IP or unique node name", arg)
-	case 1:
-		return ip, nil
-	default:
-		return ip, fmt.Errorf("ambiguous exit node name %q", arg)
-	}
-}
-
 // prefsFromUpArgs returns the ipn.Prefs for the provided args.
 //
 // Note that the parameters upArgs and warnf are named intentionally
@@ -316,23 +283,8 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 		return nil, err
 	}
 
-	var exitNodeIP netaddr.IP
-	if upArgs.exitNodeIP != "" {
-		var err error
-		exitNodeIP, err = exitNodeIPOfArg(upArgs.exitNodeIP, st)
-		if err != nil {
-			return nil, err
-		}
-	} else if upArgs.exitNodeAllowLANAccess {
+	if upArgs.exitNodeIP == "" && upArgs.exitNodeAllowLANAccess {
 		return nil, fmt.Errorf("--exit-node-allow-lan-access can only be used with --exit-node")
-	}
-
-	if upArgs.exitNodeIP != "" {
-		for _, ip := range st.TailscaleIPs {
-			if exitNodeIP == ip {
-				return nil, fmt.Errorf("cannot use %s as the exit node as it is a local IP address to this machine, did you mean --advertise-exit-node?", upArgs.exitNodeIP)
-			}
-		}
 	}
 
 	var tags []string
@@ -354,7 +306,17 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	prefs.ControlURL = upArgs.server
 	prefs.WantRunning = true
 	prefs.RouteAll = upArgs.acceptRoutes
-	prefs.ExitNodeIP = exitNodeIP
+
+	if upArgs.exitNodeIP != "" {
+		if err := prefs.SetExitNodeIP(upArgs.exitNodeIP, st); err != nil {
+			var e ipn.ExitNodeLocalIPError
+			if errors.As(err, &e) {
+				return nil, fmt.Errorf("%w; did you mean --advertise-exit-node?", err)
+			}
+			return nil, err
+		}
+	}
+
 	prefs.ExitNodeAllowLANAccess = upArgs.exitNodeAllowLANAccess
 	prefs.CorpDNS = upArgs.acceptDNS
 	prefs.AllowSingleHosts = upArgs.singleRoutes
@@ -447,7 +409,7 @@ func runUp(ctx context.Context, args []string) error {
 		fatalf("too many non-flag arguments: %q", args)
 	}
 
-	st, err := tailscale.Status(ctx)
+	st, err := localClient.Status(ctx)
 	if err != nil {
 		return fixTailscaledConnectError(err)
 	}
@@ -488,12 +450,12 @@ func runUp(ctx context.Context, args []string) error {
 	}
 
 	if len(prefs.AdvertiseRoutes) > 0 {
-		if err := tailscale.CheckIPForwarding(context.Background()); err != nil {
+		if err := localClient.CheckIPForwarding(context.Background()); err != nil {
 			warnf("%v", err)
 		}
 	}
 
-	curPrefs, err := tailscale.GetPrefs(ctx)
+	curPrefs, err := localClient.GetPrefs(ctx)
 	if err != nil {
 		return err
 	}
@@ -507,12 +469,24 @@ func runUp(ctx context.Context, args []string) error {
 		backendState:  st.BackendState,
 		curExitNodeIP: exitNodeIP(curPrefs, st),
 	}
+
+	if upArgs.runSSH != curPrefs.RunSSH && isSSHOverTailscale() {
+		if upArgs.runSSH {
+			err = presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will reroute SSH traffic to Tailscale SSH and will result in your session disconnecting.`)
+		} else {
+			err = presentRiskToUser(riskLoseSSH, `You are connected using Tailscale SSH; this action will result in your session disconnecting.`)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
 	simpleUp, justEditMP, err := updatePrefs(prefs, curPrefs, env)
 	if err != nil {
 		fatalf("%s", err)
 	}
 	if justEditMP != nil {
-		_, err := tailscale.EditPrefs(ctx, justEditMP)
+		_, err := localClient.EditPrefs(ctx, justEditMP)
 		return err
 	}
 
@@ -623,7 +597,7 @@ func runUp(ctx context.Context, args []string) error {
 	// Special case: bare "tailscale up" means to just start
 	// running, if there's ever been a login.
 	if simpleUp {
-		_, err := tailscale.EditPrefs(ctx, &ipn.MaskedPrefs{
+		_, err := localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
 			Prefs: ipn.Prefs{
 				WantRunning: true,
 			},
@@ -633,6 +607,10 @@ func runUp(ctx context.Context, args []string) error {
 			return err
 		}
 	} else {
+		if err := localClient.CheckPrefs(ctx, prefs); err != nil {
+			return err
+		}
+
 		authKey, err := upArgs.getAuthKey()
 		if err != nil {
 			return err
@@ -670,6 +648,12 @@ func runUp(ctx context.Context, args []string) error {
 	// need to prioritize reads from 'running' if it's
 	// readable; its send does happen before the pump mechanism
 	// shuts down. (Issue 2333)
+	var timeoutCh <-chan time.Time
+	if upArgs.timeout > 0 {
+		timeoutTimer := time.NewTimer(upArgs.timeout)
+		defer timeoutTimer.Stop()
+		timeoutCh = timeoutTimer.C
+	}
 	select {
 	case <-running:
 		return nil
@@ -687,6 +671,8 @@ func runUp(ctx context.Context, args []string) error {
 		default:
 		}
 		return err
+	case <-timeoutCh:
+		return errors.New(`timeout waiting for Tailscale service to enter a Running state; check health with "tailscale status"`)
 	}
 }
 
@@ -743,7 +729,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "auth-key", "force-reauth", "reset", "qr", "json":
+	case "auth-key", "force-reauth", "reset", "qr", "json", "timeout", "accept-risk":
 		return true
 	}
 	return false
@@ -888,8 +874,8 @@ func flagAppliesToOS(flag, goos string) bool {
 	return true
 }
 
-func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]interface{}) {
-	ret := make(map[string]interface{})
+func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
+	ret := make(map[string]any)
 
 	exitNodeIPStr := func() string {
 		if !prefs.ExitNodeIP.IsZero() {
@@ -906,7 +892,7 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]interfac
 		if preflessFlag(f.Name) {
 			return
 		}
-		set := func(v interface{}) {
+		set := func(v any) {
 			if flagAppliesToOS(f.Name, env.goos) {
 				ret[f.Name] = v
 			} else {
@@ -960,7 +946,7 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]interfac
 	return ret
 }
 
-func fmtFlagValueArg(flagName string, val interface{}) string {
+func fmtFlagValueArg(flagName string, val any) string {
 	if val == true {
 		return "--" + flagName
 	}

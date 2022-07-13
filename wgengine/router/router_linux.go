@@ -84,7 +84,7 @@ type netfilterRunner interface {
 
 type linuxRouter struct {
 	closed           syncs.AtomicBool
-	logf             func(fmt string, args ...interface{})
+	logf             func(fmt string, args ...any)
 	tunname          string
 	linkMon          *monitor.Mon
 	unregLinkMon     func()
@@ -246,9 +246,6 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
 func (r *linuxRouter) Up() error {
 	if r.unregLinkMon == nil && r.linkMon != nil {
 		r.unregLinkMon = r.linkMon.RegisterRuleDeleteCallback(r.onIPRuleDeleted)
-	}
-	if err := r.delLegacyNetfilter(); err != nil {
-		return err
 	}
 	if err := r.addIPRules(); err != nil {
 		return fmt.Errorf("adding IP rules: %w", err)
@@ -1380,38 +1377,6 @@ func (r *linuxRouter) delSNATRule() error {
 	return nil
 }
 
-func (r *linuxRouter) delLegacyNetfilter() error {
-	if distro.Get() == distro.Synology {
-		// We don't support netfilter on Synology, and unlike other platforms
-		// the following commands error out as the `comment` module doesn't
-		// exist in the iptables binary present on Synology. Albeit the errors
-		// are ignored it's nice to not have logspam.
-		return nil
-	}
-
-	del := func(table, chain string, args ...string) error {
-		exists, err := r.ipt4.Exists(table, chain, args...)
-		if err != nil {
-			return fmt.Errorf("checking for %v in %s/%s: %w", args, table, chain, err)
-		}
-		if exists {
-			if err := r.ipt4.Delete(table, chain, args...); err != nil {
-				return fmt.Errorf("deleting %v in %s/%s: %w", args, table, chain, err)
-			}
-		}
-		return nil
-	}
-
-	if err := del("filter", "FORWARD", "-m", "comment", "--comment", "tailscale", "-i", r.tunname, "-j", "ACCEPT"); err != nil {
-		r.logf("failed to delete legacy rule, continuing anyway: %v", err)
-	}
-	if err := del("nat", "POSTROUTING", "-m", "comment", "--comment", "tailscale", "-o", "eth0", "-j", "MASQUERADE"); err != nil {
-		r.logf("failed to delete legacy rule, continuing anyway: %v", err)
-	}
-
-	return nil
-}
-
 // cidrDiff calls add and del as needed to make the set of prefixes in
 // old and new match. Returns a map reflecting the actual new state
 // (which may be somewhere in between old and new if some commands
@@ -1549,8 +1514,14 @@ func supportsV6NAT() bool {
 		// Can't read the file. Assume SNAT works.
 		return true
 	}
-
-	return bytes.Contains(bs, []byte("nat\n"))
+	if bytes.Contains(bs, []byte("nat\n")) {
+		return true
+	}
+	// In nftables mode, that proc file will be empty. Try another thing:
+	if exec.Command("modprobe", "ip6table_nat").Run() == nil {
+		return true
+	}
+	return false
 }
 
 func checkIPRuleSupportsV6(logf logger.Logf) error {

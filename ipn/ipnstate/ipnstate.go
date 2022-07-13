@@ -112,7 +112,7 @@ type PeerStatus struct {
 
 	// Tags are the list of ACL tags applied to this node.
 	// See tailscale.com/tailcfg#Node.Tags for more information.
-	Tags *views.StringSlice `json:",omitempty"`
+	Tags *views.Slice[string] `json:",omitempty"`
 
 	// PrimaryRoutes are the routes this node is currently the primary
 	// subnet router for, as determined by the control plane. It does
@@ -144,6 +144,9 @@ type PeerStatus struct {
 
 	PeerAPIURL   []string
 	Capabilities []string `json:",omitempty"`
+
+	// SSH_HostKeys are the node's SSH host keys, if known.
+	SSH_HostKeys []string `json:"sshHostKeys,omitempty"`
 
 	// ShareeNode indicates this node exists in the netmap because
 	// it's owned by a shared-to user and that node might connect
@@ -284,6 +287,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if v := st.OS; v != "" {
 		e.OS = st.OS
 	}
+	if v := st.SSH_HostKeys; v != nil {
+		e.SSH_HostKeys = v
+	}
 	if v := st.Addrs; v != nil {
 		e.Addrs = v
 	}
@@ -342,11 +348,12 @@ type StatusUpdater interface {
 }
 
 func (st *Status) WriteHTML(w io.Writer) {
-	f := func(format string, args ...interface{}) { fmt.Fprintf(w, format, args...) }
+	f := func(format string, args ...any) { fmt.Fprintf(w, format, args...) }
 
 	f(`<!DOCTYPE html>
 <html lang="en">
 <head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Tailscale State</title>
 <style>
 body { font-family: monospace; }
@@ -473,6 +480,8 @@ func osEmoji(os string) string {
 
 // PingResult contains response information for the "tailscale ping" subcommand,
 // saying how Tailscale can reach a Tailscale IP or subnet-routed IP.
+// See tailcfg.PingResponse for a related response that is sent back to control
+// for remote diagnostic pings.
 type PingResult struct {
 	IP       string // ping destination
 	NodeIP   string // Tailscale IP of node handling IP (different for subnet routers)
@@ -499,11 +508,31 @@ type PingResult struct {
 	// running the server on.
 	PeerAPIPort uint16 `json:",omitempty"`
 
+	// PeerAPIURL is the URL that was hit for pings of type "peerapi" (tailcfg.PingPeerAPI).
+	// It's of the form "http://ip:port" (or [ip]:port for IPv6).
+	PeerAPIURL string `json:",omitempty"`
+
 	// IsLocalIP is whether the ping request error is due to it being
 	// a ping to the local node.
 	IsLocalIP bool `json:",omitempty"`
 
 	// TODO(bradfitz): details like whether port mapping was used on either side? (Once supported)
+}
+
+func (pr *PingResult) ToPingResponse(pingType tailcfg.PingType) *tailcfg.PingResponse {
+	return &tailcfg.PingResponse{
+		Type:           pingType,
+		IP:             pr.IP,
+		NodeIP:         pr.NodeIP,
+		NodeName:       pr.NodeName,
+		Err:            pr.Err,
+		LatencySeconds: pr.LatencySeconds,
+		Endpoint:       pr.Endpoint,
+		DERPRegionID:   pr.DERPRegionID,
+		DERPRegionCode: pr.DERPRegionCode,
+		PeerAPIPort:    pr.PeerAPIPort,
+		IsLocalIP:      pr.IsLocalIP,
+	}
 }
 
 func SortPeers(peers []*PeerStatus) {

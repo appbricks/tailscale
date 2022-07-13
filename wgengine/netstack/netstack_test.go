@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/refs"
 	"inet.af/netaddr"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsdial"
@@ -21,7 +22,7 @@ import (
 func TestInjectInboundLeak(t *testing.T) {
 	tunDev := tstun.NewFake()
 	dialer := new(tsdial.Dialer)
-	logf := func(format string, args ...interface{}) {
+	logf := func(format string, args ...any) {
 		if !t.Failed() {
 			t.Logf(format, args...)
 		}
@@ -38,12 +39,12 @@ func TestInjectInboundLeak(t *testing.T) {
 	if !ok {
 		t.Fatal("not an InternalsGetter")
 	}
-	tunWrap, magicSock, ok := ig.GetInternals()
+	tunWrap, magicSock, dns, ok := ig.GetInternals()
 	if !ok {
 		t.Fatal("failed to get internals")
 	}
 
-	ns, err := Create(logf, tunWrap, eng, magicSock, dialer)
+	ns, err := Create(logf, tunWrap, eng, magicSock, dialer, dns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,4 +74,13 @@ func getMemStats() (ms runtime.MemStats) {
 	runtime.GC()
 	runtime.ReadMemStats(&ms)
 	return
+}
+
+func TestNetstackLeakMode(t *testing.T) {
+	// See the comments in init(), and/or in issue #4309.
+	// Influenced by an envknob that may be useful in tests, so just check that
+	// it's not the oddly behaving zero value.
+	if refs.GetLeakMode() == 0 {
+		t.Fatalf("refs.leakMode is 0, want a non-zero value")
+	}
 }

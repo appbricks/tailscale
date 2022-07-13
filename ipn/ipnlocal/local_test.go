@@ -14,6 +14,7 @@ import (
 
 	"inet.af/netaddr"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -301,8 +302,31 @@ func TestPeerRoutes(t *testing.T) {
 				},
 			},
 			want: []netaddr.IPPrefix{
-				pp("fd7a:115c:a1e0::/48"),
 				pp("100.64.0.0/10"),
+				pp("fd7a:115c:a1e0::/48"),
+			},
+		},
+		{
+			name: "output-should-be-sorted",
+			peers: []wgcfg.Peer{
+				{
+					AllowedIPs: []netaddr.IPPrefix{
+						pp("100.64.0.2/32"),
+						pp("10.0.0.0/16"),
+					},
+				},
+				{
+					AllowedIPs: []netaddr.IPPrefix{
+						pp("100.64.0.1/32"),
+						pp("10.0.0.0/8"),
+					},
+				},
+			},
+			want: []netaddr.IPPrefix{
+				pp("10.0.0.0/8"),
+				pp("10.0.0.0/16"),
+				pp("100.64.0.1/32"),
+				pp("100.64.0.2/32"),
 			},
 		},
 	}
@@ -457,7 +481,7 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 	panicOnMachineKeyGeneration = true
 
 	var logf logger.Logf = logger.Discard
-	store := new(ipn.MemoryStore)
+	store := new(mem.Store)
 	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)

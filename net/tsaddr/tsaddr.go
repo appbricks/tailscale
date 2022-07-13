@@ -6,6 +6,8 @@
 package tsaddr
 
 import (
+	"encoding/binary"
+	"errors"
 	"sync"
 
 	"inet.af/netaddr"
@@ -34,6 +36,7 @@ var (
 	cgnatRange   oncePrefix
 	ulaRange     oncePrefix
 	tsUlaRange   oncePrefix
+	tsViaRange   oncePrefix
 	ula4To6Range oncePrefix
 	ulaEph6Range oncePrefix
 	serviceIPv6  oncePrefix
@@ -70,6 +73,14 @@ func IsTailscaleIP(ip netaddr.IP) bool {
 func TailscaleULARange() netaddr.IPPrefix {
 	tsUlaRange.Do(func() { mustPrefix(&tsUlaRange.v, "fd7a:115c:a1e0::/48") })
 	return tsUlaRange.v
+}
+
+// TailscaleViaRange returns the IPv6 Unique Local Address subset range
+// TailscaleULARange that's used for IPv4 tunneling via IPv6.
+func TailscaleViaRange() netaddr.IPPrefix {
+	// Mnemonic: "b1a" sounds like "via".
+	tsViaRange.Do(func() { mustPrefix(&tsViaRange.v, "fd7a:115c:a1e0:b1a::/64") })
+	return tsViaRange.v
 }
 
 // Tailscale4To6Range returns the subset of TailscaleULARange used for
@@ -115,6 +126,18 @@ func Tailscale4To6(ipv4 netaddr.IP) netaddr.IP {
 	v4 := ipv4.As4()
 	copy(ret[13:], v4[1:])
 	return netaddr.IPFrom16(ret)
+}
+
+// Tailscale6to4 returns the IPv4 address corresponding to the given
+// tailscale IPv6 address within the 4To6 range. The IPv4 address
+// and true are returned if the given address was in the correct range,
+// false if not.
+func Tailscale6to4(ipv6 netaddr.IP) (netaddr.IP, bool) {
+	if !ipv6.Is6() || !Tailscale4To6Range().Contains(ipv6) {
+		return netaddr.IP{}, false
+	}
+	v6 := ipv6.As16()
+	return netaddr.IPv4(100, v6[13], v6[14], v6[15]), true
 }
 
 func mustPrefix(v *netaddr.IPPrefix, prefix string) {
@@ -213,3 +236,75 @@ func PrefixIs4(p netaddr.IPPrefix) bool { return p.IP().Is4() }
 
 // PrefixIs6 reports whether p is an IPv6 prefix.
 func PrefixIs6(p netaddr.IPPrefix) bool { return p.IP().Is6() }
+
+// ContainsExitRoutes reports whether rr contains both the IPv4 and
+// IPv6 /0 route.
+func ContainsExitRoutes(rr []netaddr.IPPrefix) bool {
+	var v4, v6 bool
+	for _, r := range rr {
+		if r == allIPv4 {
+			v4 = true
+		} else if r == allIPv6 {
+			v6 = true
+		}
+	}
+	return v4 && v6
+}
+
+var (
+	allIPv4 = netaddr.MustParseIPPrefix("0.0.0.0/0")
+	allIPv6 = netaddr.MustParseIPPrefix("::/0")
+)
+
+// AllIPv4 returns 0.0.0.0/0.
+func AllIPv4() netaddr.IPPrefix { return allIPv4 }
+
+// AllIPv6 returns ::/0.
+func AllIPv6() netaddr.IPPrefix { return allIPv6 }
+
+// ExitRoutes returns a slice containing AllIPv4 and AllIPv6.
+func ExitRoutes() []netaddr.IPPrefix { return []netaddr.IPPrefix{allIPv4, allIPv6} }
+
+// FilterPrefixes returns a new slice, not aliasing in, containing elements of
+// in that match f.
+func FilterPrefixesCopy(in []netaddr.IPPrefix, f func(netaddr.IPPrefix) bool) []netaddr.IPPrefix {
+	var out []netaddr.IPPrefix
+	for _, v := range in {
+		if f(v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// IsViaPrefix reports whether p is a CIDR in the Tailscale "via" range.
+// See TailscaleViaRange.
+func IsViaPrefix(p netaddr.IPPrefix) bool {
+	return TailscaleViaRange().Contains(p.IP())
+}
+
+// UnmapVia returns the IPv4 address that corresponds to the provided Tailscale
+// "via" IPv4-in-IPv6 address.
+//
+// If ip is not a via address, it returns ip unchanged.
+func UnmapVia(ip netaddr.IP) netaddr.IP {
+	if TailscaleViaRange().Contains(ip) {
+		a := ip.As16()
+		return netaddr.IPFrom4(*(*[4]byte)(a[12:16]))
+	}
+	return ip
+}
+
+// MapVia returns an IPv6 "via" route for an IPv4 CIDR in a given siteID.
+func MapVia(siteID uint32, v4 netaddr.IPPrefix) (via netaddr.IPPrefix, err error) {
+	if !v4.IP().Is4() {
+		return via, errors.New("want IPv4 CIDR with a site ID")
+	}
+	viaRange16 := TailscaleViaRange().IP().As16()
+	var a [16]byte
+	copy(a[:], viaRange16[:8])
+	binary.BigEndian.PutUint32(a[8:], siteID)
+	ip4a := v4.IP().As4()
+	copy(a[12:], ip4a[:])
+	return netaddr.IPPrefixFrom(netaddr.IPFrom16(a), v4.Bits()+64+32), nil
+}

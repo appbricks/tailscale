@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"expvar"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -241,7 +243,7 @@ func TestStdHandler(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var logs []AccessLogRecord
-			logf := func(fmt string, args ...interface{}) {
+			logf := func(fmt string, args ...any) {
 				if fmt == "%s" {
 					logs = append(logs, args[0].(AccessLogRecord))
 				}
@@ -378,19 +380,19 @@ func TestVarzHandler(t *testing.T) {
 		{
 			"func_float64",
 			"counter_x",
-			expvar.Func(func() interface{} { return float64(1.2) }),
+			expvar.Func(func() any { return float64(1.2) }),
 			"# TYPE x counter\nx 1.2\n",
 		},
 		{
 			"func_float64_gauge",
 			"gauge_x",
-			expvar.Func(func() interface{} { return float64(1.2) }),
+			expvar.Func(func() any { return float64(1.2) }),
 			"# TYPE x gauge\nx 1.2\n",
 		},
 		{
 			"func_float64_untyped",
 			"x",
-			expvar.Func(func() interface{} { return float64(1.2) }),
+			expvar.Func(func() any { return float64(1.2) }),
 			"x 1.2\n",
 		},
 		{
@@ -466,8 +468,14 @@ foo_AUint16 65535
 		{
 			"func_returning_int",
 			"num_goroutines",
-			expvar.Func(func() interface{} { return 123 }),
+			expvar.Func(func() any { return 123 }),
 			"num_goroutines 123\n",
+		},
+		{
+			"var_that_exports_itself",
+			"custom_var",
+			promWriter{},
+			"custom_var_value 42\n",
 		},
 	}
 	for _, tt := range tests {
@@ -531,6 +539,86 @@ type expvarAdapter struct {
 
 func (expvarAdapter) String() string { return "{}" } // expvar JSON; unused in test
 
-func (a expvarAdapter) PrometheusMetricsReflectRoot() interface{} {
+func (a expvarAdapter) PrometheusMetricsReflectRoot() any {
 	return a.st
+}
+
+type promWriter struct{}
+
+func (promWriter) WritePrometheus(w io.Writer, prefix string) {
+	fmt.Fprintf(w, "%s_value 42\n", prefix)
+}
+
+func (promWriter) String() string {
+	return ""
+}
+
+func TestAcceptsEncoding(t *testing.T) {
+	tests := []struct {
+		in, enc string
+		want    bool
+	}{
+		{"", "gzip", false},
+		{"gzip", "gzip", true},
+		{"foo,gzip", "gzip", true},
+		{"foo, gzip", "gzip", true},
+		{"foo, gzip ", "gzip", true},
+		{"gzip, foo ", "gzip", true},
+		{"gzip, foo ", "br", false},
+		{"gzip, foo ", "fo", false},
+		{"gzip;q=1.2, foo ", "gzip", true},
+		{" gzip;q=1.2, foo ", "gzip", true},
+	}
+	for i, tt := range tests {
+		h := make(http.Header)
+		if tt.in != "" {
+			h.Set("Accept-Encoding", tt.in)
+		}
+		got := AcceptsEncoding(&http.Request{Header: h}, tt.enc)
+		if got != tt.want {
+			t.Errorf("%d. got %v; want %v", i, got, tt.want)
+		}
+	}
+}
+
+func TestPort80Handler(t *testing.T) {
+	tests := []struct {
+		name    string
+		h       *Port80Handler
+		req     string
+		wantLoc string
+	}{
+		{
+			name:    "no_fqdn",
+			h:       &Port80Handler{},
+			req:     "GET / HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+			wantLoc: "https://foo.com/",
+		},
+		{
+			name:    "fqdn_and_path",
+			h:       &Port80Handler{FQDN: "bar.com"},
+			req:     "GET /path HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+			wantLoc: "https://bar.com/path",
+		},
+		{
+			name:    "path_and_query_string",
+			h:       &Port80Handler{FQDN: "baz.com"},
+			req:     "GET /path?a=b HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+			wantLoc: "https://baz.com/path?a=b",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := http.ReadRequest(bufio.NewReader(strings.NewReader(tt.req)))
+			rec := httptest.NewRecorder()
+			tt.h.ServeHTTP(rec, r)
+			got := rec.Result()
+			if got, want := got.StatusCode, 302; got != want {
+				t.Errorf("got status code %v; want %v", got, want)
+			}
+			if got, want := got.Header.Get("Location"), "https://foo.com/"; got != tt.wantLoc {
+				t.Errorf("Location = %q; want %q", got, want)
+			}
+		})
+	}
 }

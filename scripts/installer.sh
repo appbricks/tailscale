@@ -41,10 +41,10 @@ main() {
 		#  - ID: the short name of the OS (e.g. "debian", "freebsd")
 		#  - VERSION_ID: the numeric release version for the OS, if any (e.g. "18.04")
 		#  - VERSION_CODENAME: the codename of the OS release, if any (e.g. "buster")
-		#  - UBUNTU_CODENAME: if it exists, as in linuxmint, use instead of VERSION_CODENAME
+		#  - UBUNTU_CODENAME: if it exists, use instead of VERSION_CODENAME
 		. /etc/os-release
 		case "$ID" in
-			ubuntu|pop|neon|zorin|elementary|linuxmint)
+			ubuntu|pop|neon|zorin)
 				OS="ubuntu"
 				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
 				    VERSION="$UBUNTU_CODENAME"
@@ -69,6 +69,45 @@ main() {
 				if [ "$VERSION_ID" -lt 11 ]; then
 					APT_KEY_TYPE="legacy"
 				else
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			linuxmint)
+				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
+				    OS="ubuntu"
+				    VERSION="$UBUNTU_CODENAME"
+				elif [ "${DEBIAN_CODENAME:-}" != "" ]; then
+				    OS="debian"
+				    VERSION="$DEBIAN_CODENAME"
+				else
+				    OS="ubuntu"
+				    VERSION="$VERSION_CODENAME"
+				fi
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 5 ]; then
+					APT_KEY_TYPE="legacy"
+				else
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			elementary)
+				OS="ubuntu"
+				VERSION="$UBUNTU_CODENAME"
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 6 ]; then
+					APT_KEY_TYPE="legacy"
+				else
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			parrot)
+				OS="debian"
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 5 ]; then
+					VERSION="buster"
+					APT_KEY_TYPE="legacy"
+				else
+					VERSION="bullseye"
 					APT_KEY_TYPE="keyring"
 				fi
 				;;
@@ -127,7 +166,7 @@ main() {
 				VERSION=""
 				PACKAGETYPE="dnf"
 				;;
-			rocky)
+			rocky|almalinux)
 				OS="fedora"
 				VERSION=""
 				PACKAGETYPE="dnf"
@@ -135,6 +174,11 @@ main() {
 			amzn)
 				OS="amazon-linux"
 				VERSION="$VERSION_ID"
+				PACKAGETYPE="yum"
+				;;
+			xenenterprise)
+				OS="centos"
+				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
 				PACKAGETYPE="yum"
 				;;
 			opensuse-leap)
@@ -270,7 +314,8 @@ main() {
 			fi
 		;;
 		rhel)
-			if [ "$VERSION" != "8" ]
+			if [ "$VERSION" != "8" ] && \
+                           [ "$VERSION" != "9" ]
 			then
 				OS_UNSUPPORTED=1
 			fi
@@ -407,7 +452,7 @@ main() {
 				exit 1
 			fi
 			export DEBIAN_FRONTEND=noninteractive
-			if ! type gpg >/dev/null; then
+			if [ "$APT_KEY_TYPE" = "legacy" ] && ! type gpg >/dev/null; then
 				$SUDO apt-get update
 				$SUDO apt-get install -y gnupg
 			fi
@@ -474,7 +519,7 @@ main() {
 			;;
 		emerge)
 			set -x
-			$SUDO emerge net-vpn/tailscale
+			$SUDO emerge --ask=n net-vpn/tailscale
 			set +x
 			;;
 		appstore)

@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"reflect"
 	"runtime"
 	"strings"
@@ -27,6 +26,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"golang.org/x/sync/singleflight"
 	"inet.af/netaddr"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
@@ -34,11 +34,13 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/log/logheap"
+	"tailscale.com/logtail"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/interfaces"
-	"tailscale.com/net/netns"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/tlsdial"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -47,6 +49,7 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/multierr"
 	"tailscale.com/util/systemd"
 	"tailscale.com/wgengine/monitor"
 )
@@ -54,7 +57,8 @@ import (
 // Direct is the client that connects to a tailcontrol server for a node.
 type Direct struct {
 	httpc                  *http.Client // HTTP client used to talk to tailcontrol
-	serverURL              string       // URL of the tailcontrol server
+	dialer                 *tsdial.Dialer
+	serverURL              string // URL of the tailcontrol server
 	timeNow                func() time.Time
 	lastPrintMap           time.Time
 	newDecompressor        func() (Decompressor, error)
@@ -67,15 +71,21 @@ type Direct struct {
 	keepSharerAndUserSplit bool
 	skipIPForwardingCheck  bool
 	pinger                 Pinger
+	popBrowser             func(url string) // or nil
 
-	mu           sync.Mutex // mutex guards the following fields
-	serverKey    key.MachinePublic
-	persist      persist.Persist
-	authKey      string
-	tryingNewKey key.NodePrivate
-	expiry       *time.Time
-	// hostinfo is mutated in-place while mu is held.
+	mu             sync.Mutex        // mutex guards the following fields
+	serverKey      key.MachinePublic // original ("legacy") nacl crypto_box-based public key
+	serverNoiseKey key.MachinePublic
+
+	sfGroup     singleflight.Group // protects noiseClient creation.
+	noiseClient *noiseClient
+
+	persist       persist.Persist
+	authKey       string
+	tryingNewKey  key.NodePrivate
+	expiry        *time.Time
 	hostinfo      *tailcfg.Hostinfo // always non-nil
+	netinfo       *tailcfg.NetInfo
 	endpoints     []tailcfg.Endpoint
 	everEndpoints bool   // whether we've ever had non-empty endpoints
 	localPort     uint16 // or zero to mean auto
@@ -93,9 +103,11 @@ type Options struct {
 	NewDecompressor      func() (Decompressor, error)
 	KeepAlive            bool
 	Logf                 logger.Logf
-	HTTPTestClient       *http.Client // optional HTTP client to use (for tests only)
-	DebugFlags           []string     // debug settings to send to control
-	LinkMonitor          *monitor.Mon // optional link monitor
+	HTTPTestClient       *http.Client     // optional HTTP client to use (for tests only)
+	DebugFlags           []string         // debug settings to send to control
+	LinkMonitor          *monitor.Mon     // optional link monitor
+	PopBrowserURL        func(url string) // optional func to open browser
+	Dialer               *tsdial.Dialer   // non-nil
 
 	// KeepSharerAndUserSplit controls whether the client
 	// understands Node.Sharer. If false, the Sharer is mapped to the User.
@@ -112,11 +124,10 @@ type Options struct {
 	Pinger Pinger
 }
 
-// Pinger is a subset of the wgengine.Engine interface, containing just the Ping method.
+// Pinger is the LocalBackend.Ping method.
 type Pinger interface {
-	// Ping is a request to start a discovery or TSMP ping with the peer handling
-	// the given IP and then call cb with its ping latency & method.
-	Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.PingResult))
+	// Ping is a request to do a ping with the peer handling the given IP.
+	Ping(ctx context.Context, ip netaddr.IP, pingType tailcfg.PingType) (*ipnstate.PingResult, error)
 }
 
 type Decompressor interface {
@@ -160,13 +171,12 @@ func NewDirect(opts Options) (*Direct, error) {
 			UseLastGood:      true,
 			LookupIPFallback: dnsfallback.Lookup,
 		}
-		dialer := netns.NewDialer(opts.Logf)
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.Proxy = tshttpproxy.ProxyFromEnvironment
 		tshttpproxy.SetTransportGetProxyConnectHeader(tr)
 		tr.TLSClientConfig = tlsdial.Config(serverURL.Hostname(), tr.TLSClientConfig)
-		tr.DialContext = dnscache.Dialer(dialer.DialContext, dnsCache)
-		tr.DialTLSContext = dnscache.TLSDialer(dialer.DialContext, dnsCache, tr.TLSClientConfig)
+		tr.DialContext = dnscache.Dialer(opts.Dialer.SystemDial, dnsCache)
+		tr.DialTLSContext = dnscache.TLSDialer(opts.Dialer.SystemDial, dnsCache, tr.TLSClientConfig)
 		tr.ForceAttemptHTTP2 = true
 		// Disable implicit gzip compression; the various
 		// handlers (register, map, set-dns, etc) do their own
@@ -201,13 +211,33 @@ func NewDirect(opts Options) (*Direct, error) {
 		linkMon:                opts.LinkMonitor,
 		skipIPForwardingCheck:  opts.SkipIPForwardingCheck,
 		pinger:                 opts.Pinger,
+		popBrowser:             opts.PopBrowserURL,
+		dialer:                 opts.Dialer,
 	}
 	if opts.Hostinfo == nil {
 		c.SetHostinfo(hostinfo.New())
 	} else {
+		ni := opts.Hostinfo.NetInfo
+		opts.Hostinfo.NetInfo = nil
 		c.SetHostinfo(opts.Hostinfo)
+		if ni != nil {
+			c.SetNetInfo(ni)
+		}
 	}
 	return c, nil
+}
+
+// Close closes the underlying Noise connection(s).
+func (c *Direct) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.noiseClient != nil {
+		if err := c.noiseClient.Close(); err != nil {
+			return err
+		}
+	}
+	c.noiseClient = nil
+	return nil
 }
 
 // SetHostinfo clones the provided Hostinfo and remembers it for the
@@ -237,14 +267,11 @@ func (c *Direct) SetNetInfo(ni *tailcfg.NetInfo) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.hostinfo == nil {
-		c.logf("[unexpected] SetNetInfo called with no HostInfo; ignoring NetInfo update: %+v", ni)
+	if reflect.DeepEqual(ni, c.netinfo) {
 		return false
 	}
-	if reflect.DeepEqual(ni, c.hostinfo.NetInfo) {
-		return false
-	}
-	c.hostinfo.NetInfo = ni.Clone()
+	c.netinfo = ni.Clone()
+	c.logf("NetInfo: %v", ni)
 	return true
 }
 
@@ -292,12 +319,41 @@ func (c *Direct) doLoginOrRegen(ctx context.Context, opt loginOpt) (newURL strin
 	return url, err
 }
 
+// SetExpirySooner attempts to shorten the expiry to the specified time.
+func (c *Direct) SetExpirySooner(ctx context.Context, expiry time.Time) error {
+	c.logf("[v1] direct.SetExpirySooner()")
+
+	newURL, err := c.doLoginOrRegen(ctx, loginOpt{Expiry: &expiry})
+	c.logf("[v1] SetExpirySooner control response: newURL=%v, err=%v", newURL, err)
+
+	return err
+}
+
 type loginOpt struct {
 	Token  *tailcfg.Oauth2Token
 	Flags  LoginFlags
-	Regen  bool
+	Regen  bool // generate a new nodekey, can be overridden in doLogin
 	URL    string
-	Logout bool
+	Logout bool // set the expiry to the far past, expiring the node
+	// Expiry, if non-nil, attempts to set the node expiry to the
+	// specified time and cannot be used to extend the expiry.
+	// It is ignored if Logout is set since Logout works by setting a
+	// expiry time in the far past.
+	Expiry *time.Time
+}
+
+// httpClient provides a common interface for the noiseClient and
+// the NaCl box http.Client.
+type httpClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// hostInfoLocked returns a Clone of c.hostinfo and c.netinfo.
+// It must only be called with c.mu held.
+func (c *Direct) hostInfoLocked() *tailcfg.Hostinfo {
+	hi := c.hostinfo.Clone()
+	hi.NetInfo = c.netinfo.Clone()
+	return hi
 }
 
 func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, newURL string, err error) {
@@ -305,8 +361,9 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	persist := c.persist
 	tryingNewKey := c.tryingNewKey
 	serverKey := c.serverKey
+	serverNoiseKey := c.serverNoiseKey
 	authKey := c.authKey
-	hi := c.hostinfo.Clone()
+	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
 	expired := c.expiry != nil && !c.expiry.IsZero() && c.expiry.Before(c.timeNow())
 	c.mu.Unlock()
@@ -336,18 +393,27 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 
 	c.logf("doLogin(regen=%v, hasUrl=%v)", regen, opt.URL != "")
 	if serverKey.IsZero() {
-		var err error
-		serverKey, err = loadServerKey(ctx, c.httpc, c.serverURL)
+		keys, err := loadServerPubKeys(ctx, c.httpc, c.serverURL)
 		if err != nil {
 			return regen, opt.URL, err
 		}
-		c.logf("control server key %s from %s", serverKey.ShortString(), c.serverURL)
+		c.logf("control server key from %s: ts2021=%s, legacy=%v", c.serverURL, keys.PublicKey.ShortString(), keys.LegacyPublicKey.ShortString())
 
 		c.mu.Lock()
-		c.serverKey = serverKey
+		c.serverKey = keys.LegacyPublicKey
+		c.serverNoiseKey = keys.PublicKey
 		c.mu.Unlock()
-	}
+		serverKey = keys.LegacyPublicKey
+		serverNoiseKey = keys.PublicKey
 
+		// For servers supporting the Noise transport,
+		// proactively shut down our TLS TCP connection.
+		// We're not going to need it and it's nicer to the
+		// server.
+		if !serverNoiseKey.IsZero() {
+			c.httpc.CloseIdleConnections()
+		}
+	}
 	var oldNodeKey key.NodePublic
 	switch {
 	case opt.Logout:
@@ -388,6 +454,8 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	}
 	if opt.Logout {
 		request.Expiry = time.Unix(123, 0) // far in the past
+	} else if opt.Expiry != nil {
+		request.Expiry = *opt.Expiry
 	}
 	c.logf("RegisterReq: onode=%v node=%v fup=%v",
 		request.OldNodeKey.ShortString(),
@@ -415,22 +483,32 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		c.logf("RegisterRequest: %s", j)
 	}
 
-	bodyData, err := encode(request, serverKey, machinePrivKey)
+	// URL and httpc are protocol specific.
+	var url string
+	var httpc httpClient
+	if serverNoiseKey.IsZero() {
+		httpc = c.httpc
+		url = fmt.Sprintf("%s/machine/%s", c.serverURL, machinePrivKey.Public().UntypedHexString())
+	} else {
+		request.Version = tailcfg.CurrentCapabilityVersion
+		httpc, err = c.getNoiseClient()
+		if err != nil {
+			return regen, opt.URL, fmt.Errorf("getNoiseClient: %w", err)
+		}
+		url = fmt.Sprintf("%s/machine/register", c.serverURL)
+		url = strings.Replace(url, "http:", "https:", 1)
+	}
+	bodyData, err := encode(request, serverKey, serverNoiseKey, machinePrivKey)
 	if err != nil {
 		return regen, opt.URL, err
 	}
-	body := bytes.NewReader(bodyData)
-
-	u := fmt.Sprintf("%s/machine/%s", c.serverURL, machinePrivKey.Public().UntypedHexString())
-	req, err := http.NewRequest("POST", u, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyData))
 	if err != nil {
 		return regen, opt.URL, err
 	}
-	req = req.WithContext(ctx)
-
-	res, err := c.httpc.Do(req)
+	res, err := httpc.Do(req)
 	if err != nil {
-		return regen, opt.URL, fmt.Errorf("register request: %v", err)
+		return regen, opt.URL, fmt.Errorf("register request: %w", err)
 	}
 	if res.StatusCode != 200 {
 		msg, _ := ioutil.ReadAll(res.Body)
@@ -439,7 +517,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 			res.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	resp := tailcfg.RegisterResponse{}
-	if err := decode(res, &resp, serverKey, machinePrivKey); err != nil {
+	if err := decode(res, &resp, serverKey, serverNoiseKey, machinePrivKey); err != nil {
 		c.logf("error decoding RegisterResponse with server key %s and machine key %s: %v", serverKey, machinePrivKey.Public(), err)
 		return regen, opt.URL, fmt.Errorf("register request: %v", err)
 	}
@@ -586,7 +664,8 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	persist := c.persist
 	serverURL := c.serverURL
 	serverKey := c.serverKey
-	hi := c.hostinfo.Clone()
+	serverNoiseKey := c.serverNoiseKey
+	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
 	localPort := c.localPort
 	var epStrs []string
@@ -624,7 +703,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	}
 
 	request := &tailcfg.MapRequest{
-		Version:       tailcfg.CurrentMapRequestVersion,
+		Version:       tailcfg.CurrentCapabilityVersion,
 		KeepAlive:     c.keepAlive,
 		NodeKey:       persist.PrivateNodeKey.Public(),
 		DiscoKey:      c.discoPubKey,
@@ -668,7 +747,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		request.ReadOnly = true
 	}
 
-	bodyData, err := encode(request, serverKey, machinePrivKey)
+	bodyData, err := encode(request, serverKey, serverNoiseKey, machinePrivKey)
 	if err != nil {
 		vlogf("netmap: encode: %v", err)
 		return err
@@ -679,14 +758,28 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 
 	machinePubKey := machinePrivKey.Public()
 	t0 := time.Now()
-	u := fmt.Sprintf("%s/machine/%s/map", serverURL, machinePubKey.UntypedHexString())
 
-	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(bodyData))
+	// Url and httpc are protocol specific.
+	var url string
+	var httpc httpClient
+	if serverNoiseKey.IsZero() {
+		httpc = c.httpc
+		url = fmt.Sprintf("%s/machine/%s/map", serverURL, machinePubKey.UntypedHexString())
+	} else {
+		httpc, err = c.getNoiseClient()
+		if err != nil {
+			return fmt.Errorf("getNoiseClient: %w", err)
+		}
+		url = fmt.Sprintf("%s/machine/map", serverURL)
+		url = strings.Replace(url, "http:", "https:", 1)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyData))
 	if err != nil {
 		return err
 	}
 
-	res, err := c.httpc.Do(req)
+	res, err := httpc.Do(req)
 	if err != nil {
 		vlogf("netmap: Do: %v", err)
 		return err
@@ -779,9 +872,17 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 
 		if pr := resp.PingRequest; pr != nil && c.isUniquePingRequest(pr) {
 			metricMapResponsePings.Add(1)
-			go answerPing(c.logf, c.httpc, pr)
+			go answerPing(c.logf, c.httpc, pr, c.pinger)
 		}
-
+		if u := resp.PopBrowserURL; u != "" && u != sess.lastPopBrowserURL {
+			sess.lastPopBrowserURL = u
+			if c.popBrowser != nil {
+				c.logf("netmap: control says to open URL %v; opening...", u)
+				c.popBrowser(u)
+			} else {
+				c.logf("netmap: control says to open URL %v; no popBrowser func", u)
+			}
+		}
 		if resp.ControlTime != nil && !resp.ControlTime.IsZero() {
 			c.logf.JSON(1, "controltime", resp.ControlTime.UTC())
 		}
@@ -790,6 +891,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		} else {
 			vlogf("netmap: got new map")
 		}
+
 		select {
 		case timeoutReset <- struct{}{}:
 			vlogf("netmap: sent timer reset")
@@ -814,6 +916,9 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 			if code := resp.Debug.Exit; code != nil {
 				c.logf("exiting process with status %v per controlplane", *code)
 				os.Exit(*code)
+			}
+			if resp.Debug.DisableLogTail {
+				logtail.Disable()
 			}
 			if resp.Debug.LogHeapPprof {
 				go logheap.LogHeap(resp.Debug.LogHeapURL)
@@ -875,7 +980,9 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	return nil
 }
 
-func decode(res *http.Response, v interface{}, serverKey key.MachinePublic, mkey key.MachinePrivate) error {
+// decode JSON decodes the res.Body into v. If serverNoiseKey is not specified,
+// it uses the serverKey and mkey to decode the message from the NaCl-crypto-box.
+func decode(res *http.Response, v any, serverKey, serverNoiseKey key.MachinePublic, mkey key.MachinePrivate) error {
 	defer res.Body.Close()
 	msg, err := ioutil.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
@@ -883,6 +990,9 @@ func decode(res *http.Response, v interface{}, serverKey key.MachinePublic, mkey
 	}
 	if res.StatusCode != 200 {
 		return fmt.Errorf("%d: %v", res.StatusCode, string(msg))
+	}
+	if !serverNoiseKey.IsZero() {
+		return json.Unmarshal(msg, v)
 	}
 	return decodeMsg(msg, v, serverKey, mkey)
 }
@@ -894,14 +1004,24 @@ var (
 
 var jsonEscapedZero = []byte(`\u0000`)
 
-func (c *Direct) decodeMsg(msg []byte, v interface{}, machinePrivKey key.MachinePrivate) error {
+// decodeMsg is responsible for uncompressing msg and unmarshaling into v.
+// If c.serverNoiseKey is not specified, it uses the c.serverKey and mkey
+// to first the decrypt msg from the NaCl-crypto-box.
+func (c *Direct) decodeMsg(msg []byte, v any, mkey key.MachinePrivate) error {
 	c.mu.Lock()
 	serverKey := c.serverKey
+	serverNoiseKey := c.serverNoiseKey
 	c.mu.Unlock()
 
-	decrypted, ok := machinePrivKey.OpenFrom(serverKey, msg)
-	if !ok {
-		return errors.New("cannot decrypt response")
+	var decrypted []byte
+	if serverNoiseKey.IsZero() {
+		var ok bool
+		decrypted, ok = mkey.OpenFrom(serverKey, msg)
+		if !ok {
+			return errors.New("cannot decrypt response")
+		}
+	} else {
+		decrypted = msg
 	}
 	var b []byte
 	if c.newDecompressor == nil {
@@ -933,7 +1053,7 @@ func (c *Direct) decodeMsg(msg []byte, v interface{}, machinePrivKey key.Machine
 
 }
 
-func decodeMsg(msg []byte, v interface{}, serverKey key.MachinePublic, machinePrivKey key.MachinePrivate) error {
+func decodeMsg(msg []byte, v any, serverKey key.MachinePublic, machinePrivKey key.MachinePrivate) error {
 	decrypted, ok := machinePrivKey.OpenFrom(serverKey, msg)
 	if !ok {
 		return errors.New("cannot decrypt response")
@@ -947,7 +1067,9 @@ func decodeMsg(msg []byte, v interface{}, serverKey key.MachinePublic, machinePr
 	return nil
 }
 
-func encode(v interface{}, serverKey key.MachinePublic, mkey key.MachinePrivate) ([]byte, error) {
+// encode JSON encodes v. If serverNoiseKey is not specified, it uses the serverKey and mkey to
+// seal the message into a NaCl-crypto-box.
+func encode(v any, serverKey, serverNoiseKey key.MachinePublic, mkey key.MachinePrivate) ([]byte, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -957,32 +1079,45 @@ func encode(v interface{}, serverKey key.MachinePublic, mkey key.MachinePrivate)
 			log.Printf("MapRequest: %s", b)
 		}
 	}
+	if !serverNoiseKey.IsZero() {
+		return b, nil
+	}
 	return mkey.SealTo(serverKey, b), nil
 }
 
-func loadServerKey(ctx context.Context, httpc *http.Client, serverURL string) (key.MachinePublic, error) {
-	req, err := http.NewRequest("GET", serverURL+"/key", nil)
+func loadServerPubKeys(ctx context.Context, httpc *http.Client, serverURL string) (*tailcfg.OverTLSPublicKeyResponse, error) {
+	keyURL := fmt.Sprintf("%v/key?v=%d", serverURL, tailcfg.CurrentCapabilityVersion)
+	req, err := http.NewRequestWithContext(ctx, "GET", keyURL, nil)
 	if err != nil {
-		return key.MachinePublic{}, fmt.Errorf("create control key request: %v", err)
+		return nil, fmt.Errorf("create control key request: %v", err)
 	}
-	req = req.WithContext(ctx)
 	res, err := httpc.Do(req)
 	if err != nil {
-		return key.MachinePublic{}, fmt.Errorf("fetch control key: %v", err)
+		return nil, fmt.Errorf("fetch control key: %v", err)
 	}
 	defer res.Body.Close()
-	b, err := ioutil.ReadAll(io.LimitReader(res.Body, 1<<16))
+	b, err := ioutil.ReadAll(io.LimitReader(res.Body, 64<<10))
 	if err != nil {
-		return key.MachinePublic{}, fmt.Errorf("fetch control key response: %v", err)
+		return nil, fmt.Errorf("fetch control key response: %v", err)
 	}
 	if res.StatusCode != 200 {
-		return key.MachinePublic{}, fmt.Errorf("fetch control key: %d: %s", res.StatusCode, string(b))
+		return nil, fmt.Errorf("fetch control key: %d", res.StatusCode)
 	}
+	var out tailcfg.OverTLSPublicKeyResponse
+	jsonErr := json.Unmarshal(b, &out)
+	if jsonErr == nil {
+		return &out, nil
+	}
+
+	// Some old control servers might not be updated to send the new format.
+	// Accept the old pre-JSON format too.
+	out = tailcfg.OverTLSPublicKeyResponse{}
 	k, err := key.ParseMachinePublicUntyped(mem.B(b))
 	if err != nil {
-		return key.MachinePublic{}, fmt.Errorf("fetch control key: %v", err)
+		return nil, multierr.New(jsonErr, err)
 	}
-	return k, nil
+	out.LegacyPublicKey = k
+	return &out, nil
 }
 
 // Debug contains temporary internal-only debug knobs.
@@ -1041,89 +1176,17 @@ func TrimWGConfig() opt.Bool {
 //
 // It should not return false positives.
 //
-// TODO(bradfitz): merge this code into LocalBackend.CheckIPForwarding
-// and change controlclient.Options.SkipIPForwardingCheck into a
-// func([]netaddr.IPPrefix) error signature instead. Then we only have
-// one copy of this code.
+// TODO(bradfitz): Change controlclient.Options.SkipIPForwardingCheck into a
+// func([]netaddr.IPPrefix) error signature instead.
 func ipForwardingBroken(routes []netaddr.IPPrefix, state *interfaces.State) bool {
-	if len(routes) == 0 {
-		// Nothing to route, so no need to warn.
+	warn, err := netutil.CheckIPForwarding(routes, state)
+	if err != nil {
+		// Oh well, we tried. This is just for debugging.
+		// We don't want false positives.
+		// TODO: maybe we want a different warning for inability to check?
 		return false
 	}
-
-	if runtime.GOOS != "linux" {
-		// We only do subnet routing on Linux for now.
-		// It might work on darwin/macOS when building from source, so
-		// don't return true for other OSes. We can OS-based warnings
-		// already in the admin panel.
-		return false
-	}
-
-	localIPs := map[netaddr.IP]bool{}
-	for _, addrs := range state.InterfaceIPs {
-		for _, pfx := range addrs {
-			localIPs[pfx.IP()] = true
-		}
-	}
-
-	v4Routes, v6Routes := false, false
-	for _, r := range routes {
-		// It's possible to advertise a route to one of the local
-		// machine's local IPs. IP forwarding isn't required for this
-		// to work, so we shouldn't warn for such exports.
-		if r.IsSingleIP() && localIPs[r.IP()] {
-			continue
-		}
-		if r.IP().Is4() {
-			v4Routes = true
-		} else {
-			v6Routes = true
-		}
-	}
-
-	if v4Routes {
-		out, err := ioutil.ReadFile("/proc/sys/net/ipv4/ip_forward")
-		if err != nil {
-			// Try another way.
-			out, err = exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
-		}
-		if err != nil {
-			// Oh well, we tried. This is just for debugging.
-			// We don't want false positives.
-			// TODO: maybe we want a different warning for inability to check?
-			return false
-		}
-		if strings.TrimSpace(string(out)) == "0" {
-			return true
-		}
-	}
-	if v6Routes {
-		// Note: you might be wondering why we check only the state of
-		// conf.all.forwarding, rather than per-interface forwarding
-		// configuration. According to kernel documentation, it seems
-		// that to actually forward packets, you need to enable
-		// forwarding globally, and the per-interface forwarding
-		// setting only alters other things such as how router
-		// advertisements are handled. The kernel itself warns that
-		// enabling forwarding per-interface and not globally will
-		// probably not work, so I feel okay calling those configs
-		// broken until we have proof otherwise.
-		out, err := ioutil.ReadFile("/proc/sys/net/ipv6/conf/all/forwarding")
-		if err != nil {
-			out, err = exec.Command("sysctl", "-n", "net.ipv6.conf.all.forwarding").Output()
-		}
-		if err != nil {
-			// Oh well, we tried. This is just for debugging.
-			// We don't want false positives.
-			// TODO: maybe we want a different warning for inability to check?
-			return false
-		}
-		if strings.TrimSpace(string(out)) == "0" {
-			return true
-		}
-	}
-
-	return false
+	return warn != nil
 }
 
 // isUniquePingRequest reports whether pr contains a new PingRequest.URL
@@ -1143,29 +1206,44 @@ func (c *Direct) isUniquePingRequest(pr *tailcfg.PingRequest) bool {
 	return true
 }
 
-func answerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest) {
+func answerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pinger Pinger) {
 	if pr.URL == "" {
 		logf("invalid PingRequest with no URL")
 		return
 	}
+	if pr.Types == "" {
+		answerHeadPing(logf, c, pr)
+		return
+	}
+	for _, t := range strings.Split(pr.Types, ",") {
+		switch pt := tailcfg.PingType(t); pt {
+		case tailcfg.PingTSMP, tailcfg.PingDisco, tailcfg.PingICMP, tailcfg.PingPeerAPI:
+			go doPingerPing(logf, c, pr, pinger, pt)
+		default:
+			logf("unsupported ping request type: %q", t)
+		}
+	}
+}
+
+func answerHeadPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "HEAD", pr.URL, nil)
 	if err != nil {
-		logf("http.NewRequestWithContext(%q): %v", pr.URL, err)
+		logf("answerHeadPing: NewRequestWithContext: %v", err)
 		return
 	}
 	if pr.Log {
-		logf("answerPing: sending ping to %v ...", pr.URL)
+		logf("answerHeadPing: sending HEAD ping to %v ...", pr.URL)
 	}
 	t0 := time.Now()
 	_, err = c.Do(req)
 	d := time.Since(t0).Round(time.Millisecond)
 	if err != nil {
-		logf("answerPing error: %v to %v (after %v)", err, pr.URL, d)
+		logf("answerHeadPing error: %v to %v (after %v)", err, pr.URL, d)
 	} else if pr.Log {
-		logf("answerPing complete to %v (after %v)", pr.URL, d)
+		logf("answerHeadPing complete to %v (after %v)", pr.URL, d)
 	}
 }
 
@@ -1200,6 +1278,78 @@ func sleepAsRequested(ctx context.Context, logf logger.Logf, timeoutReset chan<-
 	}
 }
 
+// getNoiseClient returns the noise client, creating one if one doesn't exist.
+func (c *Direct) getNoiseClient() (*noiseClient, error) {
+	c.mu.Lock()
+	serverNoiseKey := c.serverNoiseKey
+	nc := c.noiseClient
+	c.mu.Unlock()
+	if serverNoiseKey.IsZero() {
+		return nil, errors.New("zero serverNoiseKey")
+	}
+	if nc != nil {
+		return nc, nil
+	}
+	np, err, _ := c.sfGroup.Do("noise", func() (any, error) {
+		k, err := c.getMachinePrivKey()
+		if err != nil {
+			return nil, err
+		}
+
+		nc, err = newNoiseClient(k, serverNoiseKey, c.serverURL, c.dialer)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.noiseClient = nc
+		return nc, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return np.(*noiseClient), nil
+}
+
+// setDNSNoise sends the SetDNSRequest request to the control plane server over Noise,
+// requesting a DNS record be created or updated.
+func (c *Direct) setDNSNoise(ctx context.Context, req *tailcfg.SetDNSRequest) error {
+	newReq := *req
+	newReq.Version = tailcfg.CurrentCapabilityVersion
+	np, err := c.getNoiseClient()
+	if err != nil {
+		return err
+	}
+	bodyData, err := json.Marshal(newReq)
+	if err != nil {
+		return err
+	}
+	res, err := np.Post(fmt.Sprintf("https://%v/%v", np.serverHost, "machine/set-dns"), "application/json", bytes.NewReader(bodyData))
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		msg, _ := ioutil.ReadAll(res.Body)
+		return fmt.Errorf("set-dns response: %v, %.200s", res.Status, strings.TrimSpace(string(msg)))
+	}
+	var setDNSRes tailcfg.SetDNSResponse
+	if err := json.NewDecoder(res.Body).Decode(&setDNSRes); err != nil {
+		c.logf("error decoding SetDNSResponse: %v", err)
+		return fmt.Errorf("set-dns-response: %w", err)
+	}
+
+	return nil
+}
+
+// noiseConfigured reports whether the client can communicate with Control
+// over Noise.
+func (c *Direct) noiseConfigured() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.serverNoiseKey.IsZero()
+}
+
 // SetDNS sends the SetDNSRequest request to the control plane server,
 // requesting a DNS record be created or updated.
 func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err error) {
@@ -1209,6 +1359,9 @@ func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err er
 			metricSetDNSError.Add(1)
 		}
 	}()
+	if c.noiseConfigured() {
+		return c.setDNSNoise(ctx, req)
+	}
 	c.mu.Lock()
 	serverKey := c.serverKey
 	c.mu.Unlock()
@@ -1224,7 +1377,9 @@ func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err er
 		return errors.New("getMachinePrivKey returned zero key")
 	}
 
-	bodyData, err := encode(req, serverKey, machinePrivKey)
+	// TODO(maisem): dedupe this codepath from SetDNSNoise.
+	var serverNoiseKey key.MachinePublic
+	bodyData, err := encode(req, serverKey, serverNoiseKey, machinePrivKey)
 	if err != nil {
 		return err
 	}
@@ -1244,44 +1399,52 @@ func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err er
 		msg, _ := ioutil.ReadAll(res.Body)
 		return fmt.Errorf("set-dns response: %v, %.200s", res.Status, strings.TrimSpace(string(msg)))
 	}
-	var setDNSRes struct{} // no fields yet
-	if err := decode(res, &setDNSRes, serverKey, machinePrivKey); err != nil {
+	var setDNSRes tailcfg.SetDNSResponse
+	if err := decode(res, &setDNSRes, serverKey, serverNoiseKey, machinePrivKey); err != nil {
 		c.logf("error decoding SetDNSResponse with server key %s and machine key %s: %v", serverKey, machinePrivKey.Public(), err)
-		return fmt.Errorf("set-dns-response: %v", err)
+		return fmt.Errorf("set-dns-response: %w", err)
 	}
 
 	return nil
 }
 
-// tsmpPing sends a Ping to pr.IP, and sends an http request back to pr.URL
-// with ping response data.
-func tsmpPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pinger Pinger) error {
-	var err error
-	if pr.URL == "" {
-		return errors.New("invalid PingRequest with no URL")
+func (c *Direct) DoNoiseRequest(req *http.Request) (*http.Response, error) {
+	nc, err := c.getNoiseClient()
+	if err != nil {
+		return nil, err
 	}
-	if pr.IP.IsZero() {
-		return errors.New("PingRequest without IP")
-	}
-	if !strings.Contains(pr.Types, "TSMP") {
-		return fmt.Errorf("PingRequest with no TSMP in Types, got %q", pr.Types)
-	}
-
-	now := time.Now()
-	pinger.Ping(pr.IP, true, func(res *ipnstate.PingResult) {
-		// Currently does not check for error since we just return if it fails.
-		err = postPingResult(now, logf, c, pr, res)
-	})
-	return err
+	return nc.Do(req)
 }
 
-func postPingResult(now time.Time, logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, res *ipnstate.PingResult) error {
-	if res.Err != "" {
-		return errors.New(res.Err)
+// doPingerPing sends a Ping to pr.IP using pinger, and sends an http request back to
+// pr.URL with ping response data.
+func doPingerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pinger Pinger, pingType tailcfg.PingType) {
+	if pr.URL == "" || pr.IP.IsZero() || pinger == nil {
+		logf("invalid ping request: missing url, ip or pinger")
+		return
 	}
-	duration := time.Since(now)
+	start := time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := pinger.Ping(ctx, pr.IP, pingType)
+	if err != nil {
+		d := time.Since(start).Round(time.Millisecond)
+		logf("doPingerPing: ping error of type %q to %v after %v: %v", pingType, pr.IP, d, err)
+		return
+	}
+	postPingResult(start, logf, c, pr, res.ToPingResponse(pingType))
+}
+
+func postPingResult(start time.Time, logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, res *tailcfg.PingResponse) error {
+	duration := time.Since(start)
 	if pr.Log {
-		logf("TSMP ping to %v completed in %v seconds. pinger.Ping took %v seconds", pr.IP, res.LatencySeconds, duration.Seconds())
+		if res.Err == "" {
+			logf("ping to %v completed in %v. pinger.Ping took %v seconds", pr.IP, res.LatencySeconds, duration)
+		} else {
+			logf("ping to %v failed after %v: %v", pr.IP, duration, res.Err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -1291,20 +1454,20 @@ func postPingResult(now time.Time, logf logger.Logf, c *http.Client, pr *tailcfg
 		return err
 	}
 	// Send the results of the Ping, back to control URL.
-	req, err := http.NewRequestWithContext(ctx, "POST", pr.URL, bytes.NewBuffer(jsonPingRes))
+	req, err := http.NewRequestWithContext(ctx, "POST", pr.URL, bytes.NewReader(jsonPingRes))
 	if err != nil {
 		return fmt.Errorf("http.NewRequestWithContext(%q): %w", pr.URL, err)
 	}
 	if pr.Log {
-		logf("tsmpPing: sending ping results to %v ...", pr.URL)
+		logf("postPingResult: sending ping results to %v ...", pr.URL)
 	}
 	t0 := time.Now()
 	_, err = c.Do(req)
 	d := time.Since(t0).Round(time.Millisecond)
 	if err != nil {
-		return fmt.Errorf("tsmpPing error: %w to %v (after %v)", err, pr.URL, d)
+		return fmt.Errorf("postPingResult error: %w to %v (after %v)", err, pr.URL, d)
 	} else if pr.Log {
-		logf("tsmpPing complete to %v (after %v)", pr.URL, d)
+		logf("postPingResult complete to %v (after %v)", pr.URL, d)
 	}
 	return nil
 }

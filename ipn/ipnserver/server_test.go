@@ -13,9 +13,11 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/netstack"
 )
 
 func TestRunMultipleAccepts(t *testing.T) {
@@ -27,7 +29,7 @@ func TestRunMultipleAccepts(t *testing.T) {
 	td := t.TempDir()
 	socketPath := filepath.Join(td, "tailscale.sock")
 
-	logf := func(format string, args ...interface{}) {
+	logf := func(format string, args ...any) {
 		format = strings.TrimRight(format, "\n")
 		println(fmt.Sprintf(format, args...))
 		t.Logf(format, args...)
@@ -51,7 +53,7 @@ func TestRunMultipleAccepts(t *testing.T) {
 		}
 	}
 
-	logTriggerTestf := func(format string, args ...interface{}) {
+	logTriggerTestf := func(format string, args ...any) {
 		logf(format, args...)
 		if strings.HasPrefix(format, "Listening on ") {
 			connect()
@@ -66,7 +68,7 @@ func TestRunMultipleAccepts(t *testing.T) {
 
 	opts := ipnserver.Options{}
 	t.Logf("pre-Run")
-	store := new(ipn.MemoryStore)
+	store := new(mem.Store)
 
 	ln, _, err := safesocket.Listen(socketPath, 0)
 	if err != nil {
@@ -74,6 +76,11 @@ func TestRunMultipleAccepts(t *testing.T) {
 	}
 	defer ln.Close()
 
-	err = ipnserver.Run(ctx, logTriggerTestf, ln, store, nil /* mon */, new(tsdial.Dialer), "dummy_logid", ipnserver.FixedEngine(eng), opts)
+	err = ipnserver.Run(ctx, logTriggerTestf, ln, store, nil /* mon */, new(tsdial.Dialer), "dummy_logid", FixedEngine(eng), opts)
 	t.Logf("ipnserver.Run = %v", err)
+}
+
+// FixedEngine returns a func that returns eng and a nil error.
+func FixedEngine(eng wgengine.Engine) func() (wgengine.Engine, *netstack.Impl, error) {
+	return func() (wgengine.Engine, *netstack.Impl, error) { return eng, nil, nil }
 }

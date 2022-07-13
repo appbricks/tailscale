@@ -6,6 +6,7 @@ package vms
 
 import (
 	_ "embed"
+	"encoding/json"
 	"log"
 
 	"github.com/tailscale/hujson"
@@ -20,6 +21,7 @@ type Distro struct {
 	MemoryMegs     int    // VM memory in megabytes
 	PackageManager string // yum/apt/dnf/zypper
 	InitSystem     string // systemd/openrc
+	HostGenerated  bool   // generated image rather than downloaded
 }
 
 func (d *Distro) InstallPre() string {
@@ -52,10 +54,12 @@ var distroData string
 
 var Distros []Distro = func() []Distro {
 	var result []Distro
-	err := hujson.Unmarshal([]byte(distroData), &result)
+	b, err := hujson.Standardize([]byte(distroData))
 	if err != nil {
 		log.Fatalf("error decoding distros: %v", err)
 	}
-
+	if err := json.Unmarshal(b, &result); err != nil {
+		log.Fatalf("error decoding distros: %v", err)
+	}
 	return result
 }()

@@ -21,9 +21,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/envknob"
 	"tailscale.com/metrics"
@@ -33,10 +36,10 @@ import (
 )
 
 func init() {
-	expvar.Publish("process_start_unix_time", expvar.Func(func() interface{} { return timeStart.Unix() }))
-	expvar.Publish("version", expvar.Func(func() interface{} { return version.Long }))
-	expvar.Publish("counter_uptime_sec", expvar.Func(func() interface{} { return int64(Uptime().Seconds()) }))
-	expvar.Publish("gauge_goroutines", expvar.Func(func() interface{} { return runtime.NumGoroutine() }))
+	expvar.Publish("process_start_unix_time", expvar.Func(func() any { return timeStart.Unix() }))
+	expvar.Publish("version", expvar.Func(func() any { return version.Long }))
+	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
+	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 }
 
 // DevMode controls whether extra output in shown, for when the binary is being run in dev mode.
@@ -87,6 +90,29 @@ func AllowDebugAccess(r *http.Request) bool {
 	return false
 }
 
+// AcceptsEncoding reports whether r accepts the named encoding
+// ("gzip", "br", etc).
+func AcceptsEncoding(r *http.Request, enc string) bool {
+	h := r.Header.Get("Accept-Encoding")
+	if h == "" {
+		return false
+	}
+	if !strings.Contains(h, enc) && !mem.ContainsFold(mem.S(h), mem.S(enc)) {
+		return false
+	}
+	remain := h
+	for len(remain) > 0 {
+		var part string
+		part, remain, _ = strings.Cut(remain, ",")
+		part = strings.TrimSpace(part)
+		part, _, _ = strings.Cut(part, ";")
+		if part == enc {
+			return true
+		}
+	}
+	return false
+}
+
 // Protected wraps a provided debug handler, h, returning a Handler
 // that enforces AllowDebugAccess and returns forbidden replies for
 // unauthorized requests.
@@ -112,7 +138,13 @@ func Uptime() time.Duration { return time.Since(timeStart).Round(time.Second) }
 // Port80Handler is the handler to be given to
 // autocert.Manager.HTTPHandler.  The inner handler is the mux
 // returned by NewMux containing registered /debug handlers.
-type Port80Handler struct{ Main http.Handler }
+type Port80Handler struct {
+	Main http.Handler
+	// FQDN is used to redirect incoming requests to https://<FQDN>.
+	// If it is not set, the hostname is calculated from the incoming
+	// request.
+	FQDN string
+}
 
 func (h Port80Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.RequestURI
@@ -128,16 +160,12 @@ func (h Port80Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Redirect authorized user to the debug handler.
 		path = "/debug/"
 	}
-	target := "https://" + stripPort(r.Host) + path
-	http.Redirect(w, r, target, http.StatusFound)
-}
-
-func stripPort(hostport string) string {
-	host, _, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return hostport
+	host := h.FQDN
+	if host == "" {
+		host = r.Host
 	}
-	return net.JoinHostPort(host, "443")
+	target := "https://" + host + path
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 // ReturnHandler is like net/http.Handler, but the handler can return an
@@ -165,6 +193,10 @@ type HandlerOptions struct {
 	// of status codes for handled responses.
 	// The keys are "1xx", "2xx", "3xx", "4xx", and "5xx".
 	StatusCodeCounters *expvar.Map
+	// If non-nil, StatusCodeCountersFull maintains counters of status
+	// codes for handled responses.
+	// The keys are HTTP numeric response codes e.g. 200, 404, ...
+	StatusCodeCountersFull *expvar.Map
 }
 
 // ReturnHandlerFunc is an adapter to allow the use of ordinary
@@ -271,10 +303,37 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.opts.StatusCodeCounters != nil {
-		key := fmt.Sprintf("%dxx", msg.Code/100)
-		h.opts.StatusCodeCounters.Add(key, 1)
+		h.opts.StatusCodeCounters.Add(responseCodeString(msg.Code/100), 1)
+	}
+
+	if h.opts.StatusCodeCountersFull != nil {
+		h.opts.StatusCodeCountersFull.Add(responseCodeString(msg.Code), 1)
 	}
 }
+
+func responseCodeString(code int) string {
+	if v, ok := responseCodeCache.Load(code); ok {
+		return v.(string)
+	}
+
+	var ret string
+	if code < 10 {
+		ret = fmt.Sprintf("%dxx", code)
+	} else {
+		ret = strconv.Itoa(code)
+	}
+	responseCodeCache.Store(code, ret)
+	return ret
+}
+
+// responseCodeCache memoizes the string form of HTTP response codes,
+// so that the hot request-handling codepath doesn't have to allocate
+// in strconv/fmt for every request.
+//
+// Keys are either full HTTP response code ints (200, 404) or "family"
+// ints representing entire families (e.g. 2 for 2xx codes). Values
+// are the string form of that code/family.
+var responseCodeCache sync.Map
 
 // loggingResponseWriter wraps a ResponseWriter and record the HTTP
 // response code that gets sent, if any.
@@ -347,6 +406,15 @@ func Error(code int, msg string, err error) HTTPError {
 	return HTTPError{Code: code, Msg: msg, Err: err}
 }
 
+// PrometheusVar is a value that knows how to format itself into
+// Prometheus metric syntax.
+type PrometheusVar interface {
+	// WritePrometheus writes the value of the var to w, in Prometheus
+	// metric syntax. All variables names written out must start with
+	// prefix (or write out a single variable named exactly prefix)
+	WritePrometheus(w io.Writer, prefix string)
+}
+
 // WritePrometheusExpvar writes kv to w in Prometheus metrics format.
 //
 // See VarzHandler for conventions. This is exported primarily for
@@ -370,13 +438,16 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 	}
 	if strings.HasPrefix(key, "labelmap_") {
 		key = strings.TrimPrefix(key, "labelmap_")
-		if i := strings.Index(key, "_"); i != -1 {
-			label, key = key[:i], key[i+1:]
+		if a, b, ok := strings.Cut(key, "_"); ok {
+			label, key = a, b
 		}
 	}
 	name := prefix + key
 
 	switch v := kv.Value.(type) {
+	case PrometheusVar:
+		v.WritePrometheus(w, name)
+		return
 	case *expvar.Int:
 		if typ == "" {
 			typ = "counter"
@@ -513,7 +584,7 @@ type PrometheusMetricsReflectRooter interface {
 	expvar.Var
 
 	// PrometheusMetricsReflectRoot returns the struct or struct pointer to walk.
-	PrometheusMetricsReflectRoot() interface{}
+	PrometheusMetricsReflectRoot() any
 }
 
 var expvarDo = expvar.Do // pulled out for tests
@@ -541,9 +612,7 @@ func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metric
 		sf := t.Field(i)
 		name := sf.Name
 		if v := sf.Tag.Get("json"); v != "" {
-			if i := strings.Index(v, ","); i != -1 {
-				v = v[:i]
-			}
+			v, _, _ = strings.Cut(v, ",")
 			if v == "-" {
 				// Skip it, regardless of its metrictype.
 				continue
@@ -564,10 +633,10 @@ func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metric
 	}
 }
 
-type expVarPromStructRoot struct{ v interface{} }
+type expVarPromStructRoot struct{ v any }
 
-func (r expVarPromStructRoot) PrometheusMetricsReflectRoot() interface{} { return r.v }
-func (r expVarPromStructRoot) String() string                            { panic("unused") }
+func (r expVarPromStructRoot) PrometheusMetricsReflectRoot() any { return r.v }
+func (r expVarPromStructRoot) String() string                    { panic("unused") }
 
 var (
 	_ PrometheusMetricsReflectRooter = expVarPromStructRoot{}

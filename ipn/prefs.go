@@ -7,6 +7,7 @@ package ipn
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -18,21 +19,30 @@ import (
 
 	"inet.af/netaddr"
 	"tailscale.com/atomicfile"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/util/dnsname"
 )
 
-//go:generate go run tailscale.com/cmd/cloner -type=Prefs -output=prefs_clone.go
+//go:generate go run tailscale.com/cmd/cloner -type=Prefs
 
 // DefaultControlURL is the URL base of the control plane
 // ("coordination server") for use when no explicit one is configured.
 // The default control plane is the hosted version run by Tailscale.com.
 const DefaultControlURL = "https://controlplane.tailscale.com"
 
+var (
+	// ErrExitNodeIDAlreadySet is returned from (*Prefs).SetExitNodeIP when the
+	// Prefs.ExitNodeID field is already set.
+	ErrExitNodeIDAlreadySet = errors.New("cannot set ExitNodeIP when ExitNodeID is already set")
+)
+
 // IsLoginServerSynonym reports whether a URL is a drop-in replacement
 // for the primary Tailscale login server.
-func IsLoginServerSynonym(val interface{}) bool {
+func IsLoginServerSynonym(val any) bool {
 	return val == "https://login.tailscale.com" || val == "https://controlplane.tailscale.com"
 }
 
@@ -418,9 +428,14 @@ func NewPrefs() *Prefs {
 }
 
 // ControlURLOrDefault returns the coordination server's URL base.
-// If not configured, DefaultControlURL is returned instead.
+//
+// If not configured, or if the configured value is a legacy name equivalent to
+// the default, then DefaultControlURL is returned instead.
 func (p *Prefs) ControlURLOrDefault() string {
 	if p.ControlURL != "" {
+		if p.ControlURL != DefaultControlURL && IsLoginServerSynonym(p.ControlURL) {
+			return DefaultControlURL
+		}
 		return p.ControlURL
 	}
 	return DefaultControlURL
@@ -442,18 +457,7 @@ func (p *Prefs) AdvertisesExitNode() bool {
 	if p == nil {
 		return false
 	}
-	var v4, v6 bool
-	for _, r := range p.AdvertiseRoutes {
-		if r.Bits() != 0 {
-			continue
-		}
-		if r.IP().Is4() {
-			v4 = true
-		} else if r.IP().Is6() {
-			v6 = true
-		}
-	}
-	return v4 && v6
+	return tsaddr.ContainsExitRoutes(p.AdvertiseRoutes)
 }
 
 // SetAdvertiseExitNode mutates p (if non-nil) to add or remove the two
@@ -477,10 +481,117 @@ func (p *Prefs) SetAdvertiseExitNode(runExit bool) {
 		netaddr.IPPrefixFrom(netaddr.IPv6Unspecified(), 0))
 }
 
-// PrefsFromBytes deserializes Prefs from a JSON blob. If
-// enforceDefaults is true, Prefs.RouteAll and Prefs.AllowSingleHosts
-// are forced on.
-func PrefsFromBytes(b []byte, enforceDefaults bool) (*Prefs, error) {
+// peerWithTailscaleIP returns the peer in st with the provided
+// Tailscale IP.
+func peerWithTailscaleIP(st *ipnstate.Status, ip netaddr.IP) (ps *ipnstate.PeerStatus, ok bool) {
+	for _, ps := range st.Peer {
+		for _, ip2 := range ps.TailscaleIPs {
+			if ip == ip2 {
+				return ps, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func isRemoteIP(st *ipnstate.Status, ip netaddr.IP) bool {
+	for _, selfIP := range st.TailscaleIPs {
+		if ip == selfIP {
+			return false
+		}
+	}
+	return true
+}
+
+// ClearExitNode sets the ExitNodeID and ExitNodeIP to their zero values.
+func (p *Prefs) ClearExitNode() {
+	p.ExitNodeID = ""
+	p.ExitNodeIP = netaddr.IP{}
+}
+
+// ExitNodeLocalIPError is returned when the requested IP address for an exit
+// node belongs to the local machine.
+type ExitNodeLocalIPError struct {
+	hostOrIP string
+}
+
+func (e ExitNodeLocalIPError) Error() string {
+	return fmt.Sprintf("cannot use %s as an exit node as it is a local IP address to this machine", e.hostOrIP)
+}
+
+func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netaddr.IP, err error) {
+	if s == "" {
+		return ip, os.ErrInvalid
+	}
+	ip, err = netaddr.ParseIP(s)
+	if err == nil {
+		// If we're online already and have a netmap, double check that the IP
+		// address specified is valid.
+		if st.BackendState == "Running" {
+			ps, ok := peerWithTailscaleIP(st, ip)
+			if !ok {
+				return ip, fmt.Errorf("no node found in netmap with IP %v", ip)
+			}
+			if !ps.ExitNodeOption {
+				return ip, fmt.Errorf("node %v is not advertising an exit node", ip)
+			}
+		}
+		if !isRemoteIP(st, ip) {
+			return ip, ExitNodeLocalIPError{s}
+		}
+		return ip, nil
+	}
+	match := 0
+	for _, ps := range st.Peer {
+		baseName := dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)
+		if !strings.EqualFold(s, baseName) {
+			continue
+		}
+		match++
+		if len(ps.TailscaleIPs) == 0 {
+			return ip, fmt.Errorf("node %q has no Tailscale IP?", s)
+		}
+		if !ps.ExitNodeOption {
+			return ip, fmt.Errorf("node %q is not advertising an exit node", s)
+		}
+		ip = ps.TailscaleIPs[0]
+	}
+	switch match {
+	case 0:
+		return ip, fmt.Errorf("invalid value %q for --exit-node; must be IP or unique node name", s)
+	case 1:
+		if !isRemoteIP(st, ip) {
+			return ip, ExitNodeLocalIPError{s}
+		}
+		return ip, nil
+	default:
+		return ip, fmt.Errorf("ambiguous exit node name %q", s)
+	}
+}
+
+// SetExitNodeIP validates and sets the ExitNodeIP from a user-provided string
+// specifying either an IP address or a MagicDNS base name ("foo", as opposed to
+// "foo.bar.beta.tailscale.net"). This method does not mutate ExitNodeID and
+// will fail if ExitNodeID is already set.
+func (p *Prefs) SetExitNodeIP(s string, st *ipnstate.Status) error {
+	if !p.ExitNodeID.IsZero() {
+		return ErrExitNodeIDAlreadySet
+	}
+	ip, err := exitNodeIPOfArg(s, st)
+	if err == nil {
+		p.ExitNodeIP = ip
+	}
+	return err
+}
+
+// ShouldSSHBeRunning reports whether the SSH server should be running based on
+// the prefs.
+func (p *Prefs) ShouldSSHBeRunning() bool {
+	return p.WantRunning && p.RunSSH
+}
+
+// PrefsFromBytes deserializes Prefs from a JSON blob.
+func PrefsFromBytes(b []byte) (*Prefs, error) {
 	p := NewPrefs()
 	if len(b) == 0 {
 		return p, nil
@@ -495,10 +606,6 @@ func PrefsFromBytes(b []byte, enforceDefaults bool) (*Prefs, error) {
 		if err != nil {
 			log.Printf("Prefs parse: %v: %v\n", err, b)
 		}
-	}
-	if enforceDefaults {
-		p.RouteAll = true
-		p.AllowSingleHosts = true
 	}
 	return p, err
 }
@@ -518,7 +625,7 @@ func LoadPrefs(filename string) (*Prefs, error) {
 		// to log in again. (better than crashing)
 		return nil, os.ErrNotExist
 	}
-	p, err := PrefsFromBytes(data, false)
+	p, err := PrefsFromBytes(data)
 	if err != nil {
 		return nil, fmt.Errorf("LoadPrefs(%q) decode: %w", filename, err)
 	}

@@ -6,10 +6,10 @@ package cli
 
 import (
 	"context"
+	"flag"
 	"fmt"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 )
 
@@ -18,7 +18,14 @@ var downCmd = &ffcli.Command{
 	ShortUsage: "down",
 	ShortHelp:  "Disconnect from Tailscale",
 
-	Exec: runDown,
+	Exec:    runDown,
+	FlagSet: newDownFlagSet(),
+}
+
+func newDownFlagSet() *flag.FlagSet {
+	downf := newFlagSet("down")
+	registerAcceptRiskFlag(downf)
+	return downf
 }
 
 func runDown(ctx context.Context, args []string) error {
@@ -26,7 +33,13 @@ func runDown(ctx context.Context, args []string) error {
 		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 
-	st, err := tailscale.Status(ctx)
+	if isSSHOverTailscale() {
+		if err := presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will disable Tailscale and result in your session disconnecting.`); err != nil {
+			return err
+		}
+	}
+
+	st, err := localClient.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("error fetching current status: %w", err)
 	}
@@ -34,7 +47,7 @@ func runDown(ctx context.Context, args []string) error {
 		fmt.Fprintf(Stderr, "Tailscale was already stopped.\n")
 		return nil
 	}
-	_, err = tailscale.EditPrefs(ctx, &ipn.MaskedPrefs{
+	_, err = localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
 		Prefs: ipn.Prefs{
 			WantRunning: false,
 		},

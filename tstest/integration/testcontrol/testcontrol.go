@@ -53,11 +53,15 @@ type Server struct {
 	initMuxOnce sync.Once
 	mux         *http.ServeMux
 
-	mu            sync.Mutex
-	inServeMap    int
-	cond          *sync.Cond // lazily initialized by condLocked
-	pubKey        key.MachinePublic
-	privKey       key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+	mu         sync.Mutex
+	inServeMap int
+	cond       *sync.Cond // lazily initialized by condLocked
+	pubKey     key.MachinePublic
+	privKey    key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+
+	noisePubKey  key.MachinePublic
+	noisePrivKey key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+
 	nodes         map[key.NodePublic]*tailcfg.Node
 	users         map[key.NodePublic]*tailcfg.User
 	logins        map[key.NodePublic]*tailcfg.Login
@@ -185,7 +189,7 @@ func (ap *AuthPath) CompleteSuccessfully() {
 	ap.closeOnce.Do(ap.completeSuccessfully)
 }
 
-func (s *Server) logf(format string, a ...interface{}) {
+func (s *Server) logf(format string, a ...any) {
 	if s.Logf != nil {
 		s.Logf(format, a...)
 	} else {
@@ -211,30 +215,43 @@ func (s *Server) serveUnhandled(w http.ResponseWriter, r *http.Request) {
 	go panic(fmt.Sprintf("testcontrol.Server received unhandled request: %s", got.Bytes()))
 }
 
-func (s *Server) publicKey() key.MachinePublic {
-	pub, _ := s.keyPair()
-	return pub
+func (s *Server) publicKeys() (noiseKey, pubKey key.MachinePublic) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureKeyPairLocked()
+	return s.noisePubKey, s.pubKey
 }
 
 func (s *Server) privateKey() key.ControlPrivate {
-	_, priv := s.keyPair()
-	return priv
-}
-
-func (s *Server) keyPair() (pub key.MachinePublic, priv key.ControlPrivate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pubKey.IsZero() {
-		s.privKey = key.NewControl()
-		s.pubKey = s.privKey.Public()
+	s.ensureKeyPairLocked()
+	return s.privKey
+}
+
+func (s *Server) ensureKeyPairLocked() {
+	if !s.pubKey.IsZero() {
+		return
 	}
-	return s.pubKey, s.privKey
+	s.noisePrivKey = key.NewControl()
+	s.noisePubKey = s.noisePrivKey.Public()
+	s.privKey = key.NewControl()
+	s.pubKey = s.privKey.Public()
 }
 
 func (s *Server) serveKey(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(200)
-	io.WriteString(w, s.publicKey().UntypedHexString())
+	_, legacyKey := s.publicKeys()
+	if r.FormValue("v") == "" {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, legacyKey.UntypedHexString())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	// TODO(maisem/bradfitz): support noise protocol here.
+	json.NewEncoder(w).Encode(&tailcfg.OverTLSPublicKeyResponse{
+		LegacyPublicKey: legacyKey,
+		// PublicKey:       noiseKey,
+	})
 }
 
 func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +262,7 @@ func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
 		mkeyStr = mkeyStr[:i]
 	}
 
+	// TODO(maisem/bradfitz): support noise protocol here.
 	mkey, err := key.ParseMachinePublicUntyped(mem.S(mkeyStr))
 	if err != nil {
 		http.Error(w, "bad machine key hex", 400)
@@ -408,19 +426,18 @@ func (s *Server) CompleteAuth(authPathOrURL string) bool {
 
 func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.MachinePublic) {
 	msg, err := ioutil.ReadAll(io.LimitReader(r.Body, msgLimit))
+	r.Body.Close()
 	if err != nil {
-		r.Body.Close()
 		http.Error(w, fmt.Sprintf("bad map request read: %v", err), 400)
 		return
 	}
-	r.Body.Close()
 
 	var req tailcfg.RegisterRequest
 	if err := s.decode(mkey, msg, &req); err != nil {
 		go panic(fmt.Sprintf("serveRegister: decode: %v", err))
 	}
-	if req.Version != 1 {
-		go panic(fmt.Sprintf("serveRegister: unsupported version: %d", req.Version))
+	if req.Version == 0 {
+		panic("serveRegister: zero Version")
 	}
 	if req.NodeKey.IsZero() {
 		go panic("serveRegister: request has zero node key")
@@ -762,7 +779,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 	return res, nil
 }
 
-func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compress bool, msg interface{}) error {
+func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compress bool, msg any) error {
 	resBytes, err := s.encode(mkey, compress, msg)
 	if err != nil {
 		return err
@@ -786,7 +803,7 @@ func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compr
 	return nil
 }
 
-func (s *Server) decode(mkey key.MachinePublic, msg []byte, v interface{}) error {
+func (s *Server) decode(mkey key.MachinePublic, msg []byte, v any) error {
 	if len(msg) == msgLimit {
 		return errors.New("encrypted message too long")
 	}
@@ -799,7 +816,7 @@ func (s *Server) decode(mkey key.MachinePublic, msg []byte, v interface{}) error
 }
 
 var zstdEncoderPool = &sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		encoder, err := smallzstd.NewEncoder(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
 		if err != nil {
 			panic(err)
@@ -808,7 +825,7 @@ var zstdEncoderPool = &sync.Pool{
 	},
 }
 
-func (s *Server) encode(mkey key.MachinePublic, compress bool, v interface{}) (b []byte, err error) {
+func (s *Server) encode(mkey key.MachinePublic, compress bool, v any) (b []byte, err error) {
 	var isBytes bool
 	if b, isBytes = v.([]byte); !isBytes {
 		b, err = json.Marshal(v)

@@ -11,6 +11,8 @@ package controlclient
 
 import (
 	"context"
+	"net/http"
+	"time"
 
 	"tailscale.com/tailcfg"
 )
@@ -45,6 +47,9 @@ type Client interface {
 	// Logout starts a synchronous logout process. It doesn't return
 	// until the logout operation has been completed.
 	Logout(context.Context) error
+	// SetExpirySooner sets the node's expiry time via the controlclient,
+	// as long as it's shorter than the current expiry time.
+	SetExpirySooner(context.Context, time.Time) error
 	// SetPaused pauses or unpauses the controlclient activity as much
 	// as possible, without losing its internal state, to minimize
 	// unnecessary network activity.
@@ -78,6 +83,9 @@ type Client interface {
 	// SetDNS sends the SetDNSRequest request to the control plane server,
 	// requesting a DNS record be created or updated.
 	SetDNS(context.Context, *tailcfg.SetDNSRequest) error
+	// DoNoiseRequest sends an HTTP request to the control plane
+	// over the Noise transport.
+	DoNoiseRequest(*http.Request) (*http.Response, error)
 }
 
 // UserVisibleError is an error that should be shown to users.

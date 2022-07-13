@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build go1.18
+// +build go1.18
+
 package main // import "tailscale.com/cmd/tailscaled"
 
 // TODO: check if administrator, like tswin does.
@@ -27,10 +30,12 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"inet.af/netaddr"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnserver"
+	"tailscale.com/ipn/store"
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/tsdial"
@@ -56,12 +61,31 @@ func isWindowsService() bool {
 	return v
 }
 
+// syslogf is a logger function that writes to the Windows event log (ie, the
+// one that you see in the Windows Event Viewer). tailscaled may optionally
+// generate diagnostic messages in the same event timeline as the Windows
+// Service Control Manager to assist with diagnosing issues with tailscaled's
+// lifetime (such as slow shutdowns).
+var syslogf logger.Logf = logger.Discard
+
 // runWindowsService starts running Tailscale under the Windows
 // Service environment.
 //
 // At this point we're still the parent process that
 // Windows started.
 func runWindowsService(pol *logpolicy.Policy) error {
+	if winutil.GetPolicyInteger("LogSCMInteractions", 0) != 0 {
+		syslog, err := eventlog.Open(serviceName)
+		if err == nil {
+			syslogf = func(format string, args ...any) {
+				syslog.Info(0, fmt.Sprintf(format, args...))
+			}
+			defer syslog.Close()
+		}
+	}
+
+	syslogf("Service entering svc.Run")
+	defer syslogf("Service exiting svc.Run")
 	return svc.Run(serviceName, &ipnService{Policy: pol})
 }
 
@@ -71,7 +95,10 @@ type ipnService struct {
 
 // Called by Windows to execute the windows service.
 func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+	defer syslogf("SvcStopped notification imminent")
+
 	changes <- svc.Status{State: svc.StartPending}
+	syslogf("Service start pending")
 
 	svcAccepts := svc.AcceptStop
 	if winutil.GetPolicyInteger("FlushDNSOnSessionUnlock", 0) != 0 {
@@ -94,26 +121,29 @@ func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 	}()
 
 	changes <- svc.Status{State: svc.Running, Accepts: svcAccepts}
+	syslogf("Service running")
 
-	for ctx.Err() == nil {
+	for {
 		select {
 		case <-doneCh:
+			return false, windows.NO_ERROR
 		case cmd := <-r:
 			log.Printf("Got Windows Service event: %v", cmdName(cmd.Cmd))
 			switch cmd.Cmd {
 			case svc.Stop:
-				cancel()
+				changes <- svc.Status{State: svc.StopPending}
+				syslogf("Service stop pending")
+				cancel() // so BabysitProc will kill the child process
 			case svc.Interrogate:
+				syslogf("Service interrogation")
 				changes <- cmd.CurrentStatus
 			case svc.SessionChange:
+				syslogf("Service session change notification")
 				handleSessionChange(cmd)
 				changes <- cmd.CurrentStatus
 			}
 		}
 	}
-
-	changes <- svc.Status{State: svc.StopPending}
-	return false, windows.NO_ERROR
 }
 
 func cmdName(c svc.Cmd) string {
@@ -230,19 +260,19 @@ func startIPNServer(ctx context.Context, logid string) error {
 
 	linkMon, err := monitor.New(logf)
 	if err != nil {
-		return err
+		return fmt.Errorf("monitor: %w", err)
 	}
 	dialer := new(tsdial.Dialer)
 
-	getEngineRaw := func() (wgengine.Engine, error) {
+	getEngineRaw := func() (wgengine.Engine, *netstack.Impl, error) {
 		dev, devName, err := tstun.New(logf, "Tailscale")
 		if err != nil {
-			return nil, fmt.Errorf("TUN: %w", err)
+			return nil, nil, fmt.Errorf("TUN: %w", err)
 		}
 		r, err := router.New(logf, dev, nil)
 		if err != nil {
 			dev.Close()
-			return nil, fmt.Errorf("router: %w", err)
+			return nil, nil, fmt.Errorf("router: %w", err)
 		}
 		if wrapNetstack {
 			r = netstack.NewSubnetRouterWrapper(r)
@@ -251,7 +281,7 @@ func startIPNServer(ctx context.Context, logid string) error {
 		if err != nil {
 			r.Close()
 			dev.Close()
-			return nil, fmt.Errorf("DNS: %w", err)
+			return nil, nil, fmt.Errorf("DNS: %w", err)
 		}
 		eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 			Tun:         dev,
@@ -264,23 +294,24 @@ func startIPNServer(ctx context.Context, logid string) error {
 		if err != nil {
 			r.Close()
 			dev.Close()
-			return nil, fmt.Errorf("engine: %w", err)
+			return nil, nil, fmt.Errorf("engine: %w", err)
 		}
 		ns, err := newNetstack(logf, dialer, eng)
 		if err != nil {
-			return nil, fmt.Errorf("newNetstack: %w", err)
+			return nil, nil, fmt.Errorf("newNetstack: %w", err)
 		}
 		ns.ProcessLocalIPs = false
 		ns.ProcessSubnets = wrapNetstack
 		if err := ns.Start(); err != nil {
-			return nil, fmt.Errorf("failed to start netstack: %w", err)
+			return nil, nil, fmt.Errorf("failed to start netstack: %w", err)
 		}
-		return wgengine.NewWatchdog(eng), nil
+		return wgengine.NewWatchdog(eng), ns, nil
 	}
 
 	type engineOrError struct {
-		Engine wgengine.Engine
-		Err    error
+		Engine   wgengine.Engine
+		Netstack *netstack.Impl
+		Err      error
 	}
 	engErrc := make(chan engineOrError)
 	t0 := time.Now()
@@ -289,7 +320,7 @@ func startIPNServer(ctx context.Context, logid string) error {
 		for try := 1; ; try++ {
 			logf("tailscaled: getting engine... (try %v)", try)
 			t1 := time.Now()
-			eng, err := getEngineRaw()
+			eng, ns, err := getEngineRaw()
 			d, dt := time.Since(t1).Round(ms), time.Since(t1).Round(ms)
 			if err != nil {
 				logf("tailscaled: engine fetch error (try %v) in %v (total %v, sysUptime %v): %v",
@@ -302,7 +333,7 @@ func startIPNServer(ctx context.Context, logid string) error {
 				}
 			}
 			timer := time.NewTimer(5 * time.Second)
-			engErrc <- engineOrError{eng, err}
+			engErrc <- engineOrError{eng, ns, err}
 			if err == nil {
 				timer.Stop()
 				return
@@ -314,14 +345,14 @@ func startIPNServer(ctx context.Context, logid string) error {
 	// getEngine is called by ipnserver to get the engine. It's
 	// not called concurrently and is not called again once it
 	// successfully returns an engine.
-	getEngine := func() (wgengine.Engine, error) {
+	getEngine := func() (wgengine.Engine, *netstack.Impl, error) {
 		if msg := envknob.String("TS_DEBUG_WIN_FAIL"); msg != "" {
-			return nil, fmt.Errorf("pretending to be a service failure: %v", msg)
+			return nil, nil, fmt.Errorf("pretending to be a service failure: %v", msg)
 		}
 		for {
 			res := <-engErrc
 			if res.Engine != nil {
-				return res.Engine, nil
+				return res.Engine, res.Netstack, nil
 			}
 			if time.Since(t0) < time.Minute || windowsUptime() < 10*time.Minute {
 				// Ignore errors during early boot. Windows 10 auto logs in the GUI
@@ -332,13 +363,12 @@ func startIPNServer(ctx context.Context, logid string) error {
 			}
 			// Return nicer errors to users, annotated with logids, which helps
 			// when they file bugs.
-			return nil, fmt.Errorf("%w\n\nlogid: %v", res.Err, logid)
+			return nil, nil, fmt.Errorf("%w\n\nlogid: %v", res.Err, logid)
 		}
 	}
-
-	store, err := ipnserver.StateStore(statePathOrDefault(), logf)
+	store, err := store.New(logf, statePathOrDefault())
 	if err != nil {
-		return err
+		return fmt.Errorf("store: %w", err)
 	}
 
 	ln, _, err := safesocket.Listen(args.socketpath, safesocket.WindowsLocalPort)

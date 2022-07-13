@@ -72,6 +72,15 @@ type Resolver struct {
 	// if a refresh fails.
 	UseLastGood bool
 
+	// SingleHostStaticResult, if non-nil, is the static result of IPs that is returned
+	// by Resolver.LookupIP for any hostname. When non-nil, SingleHost must also be
+	// set with the expected name.
+	SingleHostStaticResult []netaddr.IP
+
+	// SingleHost is the hostname that SingleHostStaticResult is for.
+	// It is required when SingleHostStaticResult is present.
+	SingleHost string
+
 	sf singleflight.Group
 
 	mu      sync.Mutex
@@ -108,6 +117,22 @@ var debug = envknob.Bool("TS_DEBUG_DNS_CACHE")
 // If err is nil, ip will be non-nil. The v6 address may be nil even
 // with a nil error.
 func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 net.IP, allIPs []net.IPAddr, err error) {
+	if r.SingleHostStaticResult != nil {
+		if r.SingleHost != host {
+			return nil, nil, nil, fmt.Errorf("dnscache: unexpected hostname %q doesn't match expected %q", host, r.SingleHost)
+		}
+		for _, naIP := range r.SingleHostStaticResult {
+			ipa := naIP.IPAddr()
+			if ip == nil && naIP.Is4() {
+				ip = ipa.IP
+			}
+			if v6 == nil && naIP.Is6() {
+				v6 = ipa.IP
+			}
+			allIPs = append(allIPs, *ipa)
+		}
+		return
+	}
 	if ip := net.ParseIP(host); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
 			return ip4, nil, []net.IPAddr{{IP: ip4}}, nil
@@ -129,7 +154,7 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 net.IP, al
 		ip, ip6 net.IP
 		allIPs  []net.IPAddr
 	}
-	ch := r.sf.DoChan(host, func() (interface{}, error) {
+	ch := r.sf.DoChan(host, func() (any, error) {
 		ip, ip6, allIPs, err := r.lookupIP(host)
 		if err != nil {
 			return nil, err
@@ -312,7 +337,7 @@ func (d *dialer) DialContext(ctx context.Context, network, address string) (retC
 	defer func() {
 		// On failure, consider that our DNS might be wrong and ask the DNS fallback mechanism for
 		// some other IPs to try.
-		if ret == nil || d.dnsCache.LookupIPFallback == nil || dc.dnsWasTrustworthy() {
+		if ret == nil || ctx.Err() != nil || d.dnsCache.LookupIPFallback == nil || dc.dnsWasTrustworthy() {
 			return
 		}
 		ips, err := d.dnsCache.LookupIPFallback(ctx, host)

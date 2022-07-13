@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build go1.18
+// +build go1.18
+
 // The tailscaled program is the Tailscale client daemon. It's configured
 // and controlled via the tailscale CLI program.
 //
@@ -22,16 +25,17 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 
 	"inet.af/netaddr"
+	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
+	"tailscale.com/ipn/store"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/net/dns"
@@ -68,11 +72,27 @@ func defaultTunName() string {
 		// as a magic value that uses/creates any free number.
 		return "utun"
 	case "linux":
-		if distro.Get() == distro.Synology {
+		switch distro.Get() {
+		case distro.Synology:
 			// Try TUN, but fall back to userspace networking if needed.
 			// See https://github.com/tailscale/tailscale-synology/issues/35
 			return "tailscale0,userspace-networking"
+		case distro.Gokrazy:
+			// Gokrazy doesn't yet work in tun mode because the whole
+			// Gokrazy thing is no C code, and Tailscale currently
+			// depends on the iptables binary for Linux's
+			// wgengine/router.
+			// But on Gokrazy there's no legacy iptables, so we could use netlink
+			// to program nft-iptables directly. It just isn't done yet;
+			// see https://github.com/tailscale/tailscale/issues/391
+			//
+			// But Gokrazy does have the tun module built-in, so users
+			// can stil run --tun=tailscale0 if they wish, if they
+			// arrange for iptables to be present or run in "tailscale
+			// up --netfilter-mode=off" mode, perhaps. Untested.
+			return "userspace-networking"
 		}
+
 	}
 	return "tailscale0"
 }
@@ -105,17 +125,10 @@ var subCommands = map[string]*func([]string) error{
 	"install-system-daemon":   &installSystemDaemon,
 	"uninstall-system-daemon": &uninstallSystemDaemon,
 	"debug":                   &debugModeFunc,
+	"be-child":                &beChildFunc,
 }
 
 func main() {
-	// We aren't very performance sensitive, and the parts that are
-	// performance sensitive (wireguard) try hard not to do any memory
-	// allocations. So let's be aggressive about garbage collection,
-	// unless the user specifically overrides it in the usual way.
-	if _, ok := os.LookupEnv("GOGC"); !ok {
-		debug.SetGCPercent(10)
-	}
-
 	printVersion := false
 	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
 	flag.BoolVar(&args.cleanup, "cleanup", false, "clean up system state and exit")
@@ -124,7 +137,7 @@ func main() {
 	flag.StringVar(&args.httpProxyAddr, "outbound-http-proxy-listen", "", `optional [ip]:port to run an outbound HTTP proxy (e.g. "localhost:8080")`)
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 	flag.Var(flagtype.PortValue(&args.port, 0), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
-	flag.StringVar(&args.statepath, "state", paths.DefaultTailscaledStateFile(), "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an emphemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state")
+	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an emphemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
 	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
@@ -145,13 +158,12 @@ func main() {
 		}
 	}
 
-	if beWindowsSubprocess() {
-		return
-	}
-
 	flag.Parse()
 	if flag.NArg() > 0 {
-		log.Fatalf("tailscaled does not take non-flag arguments: %q", flag.Args())
+		// Windows subprocess is spawned with /subprocess, so we need to avoid this check there.
+		if runtime.GOOS != "windows" || flag.Arg(0) != "/subproc" {
+			log.Fatalf("tailscaled does not take non-flag arguments: %q", flag.Args())
+		}
 	}
 
 	if printVersion {
@@ -172,6 +184,16 @@ func main() {
 	if args.birdSocketPath != "" && createBIRDClient == nil {
 		log.SetFlags(0)
 		log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
+	}
+
+	// Only apply a default statepath when neither have been provided, so that a
+	// user may specify only --statedir if they wish.
+	if args.statepath == "" && args.statedir == "" {
+		args.statepath = paths.DefaultTailscaledStateFile()
+	}
+
+	if beWindowsSubprocess() {
+		return
 	}
 
 	err := run()
@@ -319,6 +341,7 @@ func run() error {
 	socksListener, httpProxyListener := mustStartProxyListeners(args.socksAddr, args.httpProxyAddr)
 
 	dialer := new(tsdial.Dialer) // mutated below (before used)
+	dialer.Logf = logf
 	e, useNetstack, err := createEngine(logf, linkMon, dialer)
 	if err != nil {
 		return fmt.Errorf("createEngine: %w", err)
@@ -328,7 +351,7 @@ func run() error {
 	}
 	if debugMux != nil {
 		if ig, ok := e.(wgengine.InternalsGetter); ok {
-			if _, mc, ok := ig.GetInternals(); ok {
+			if _, mc, _, ok := ig.GetInternals(); ok {
 				debugMux.HandleFunc("/debug/magicsock", mc.ServeHTTPDebug)
 			}
 		}
@@ -381,6 +404,7 @@ func run() error {
 	// want to keep running.
 	signal.Ignore(syscall.SIGPIPE)
 	go func() {
+		defer dialer.Close()
 		select {
 		case s := <-interrupt:
 			logf("tailscaled got signal %v; shutting down", s)
@@ -392,9 +416,9 @@ func run() error {
 
 	opts := ipnServerOpts()
 
-	store, err := ipnserver.StateStore(statePathOrDefault(), logf)
+	store, err := store.New(logf, statePathOrDefault())
 	if err != nil {
-		return fmt.Errorf("ipnserver.StateStore: %w", err)
+		return fmt.Errorf("store.New: %w", err)
 	}
 	srv, err := ipnserver.New(logf, pol.PublicID.String(), store, e, dialer, nil, opts)
 	if err != nil {
@@ -551,11 +575,11 @@ func runDebugServer(mux *http.ServeMux, addr string) {
 }
 
 func newNetstack(logf logger.Logf, dialer *tsdial.Dialer, e wgengine.Engine) (*netstack.Impl, error) {
-	tunDev, magicConn, ok := e.(wgengine.InternalsGetter).GetInternals()
+	tunDev, magicConn, dns, ok := e.(wgengine.InternalsGetter).GetInternals()
 	if !ok {
 		return nil, fmt.Errorf("%T is not a wgengine.InternalsGetter", e)
 	}
-	return netstack.Create(logf, tunDev, e, magicConn, dialer)
+	return netstack.Create(logf, tunDev, e, magicConn, dialer, dns)
 }
 
 // mustStartProxyListeners creates listeners for local SOCKS and HTTP
@@ -600,4 +624,18 @@ func mustStartProxyListeners(socksAddr, httpAddr string) (socksListener, httpLis
 	}
 
 	return socksListener, httpListener
+}
+
+var beChildFunc = beChild
+
+func beChild(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing mode argument")
+	}
+	typ := args[0]
+	f, ok := childproc.Code[typ]
+	if !ok {
+		return fmt.Errorf("unknown be-child mode %q", typ)
+	}
+	return f(args[1:])
 }

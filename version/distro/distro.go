@@ -8,31 +8,41 @@ package distro
 import (
 	"os"
 	"runtime"
+	"sync/atomic"
 )
 
 type Distro string
 
 const (
-	Debian   = Distro("debian")
-	Arch     = Distro("arch")
-	Synology = Distro("synology")
-	OpenWrt  = Distro("openwrt")
-	NixOS    = Distro("nixos")
-	QNAP     = Distro("qnap")
-	Pfsense  = Distro("pfsense")
-	OPNsense = Distro("opnsense")
-	TrueNAS  = Distro("truenas")
+	Debian    = Distro("debian")
+	Arch      = Distro("arch")
+	Synology  = Distro("synology")
+	OpenWrt   = Distro("openwrt")
+	NixOS     = Distro("nixos")
+	QNAP      = Distro("qnap")
+	Pfsense   = Distro("pfsense")
+	OPNsense  = Distro("opnsense")
+	TrueNAS   = Distro("truenas")
+	Gokrazy   = Distro("gokrazy")
+	WDMyCloud = Distro("wdmycloud")
 )
+
+var distroAtomic atomic.Value // of Distro
 
 // Get returns the current distro, or the empty string if unknown.
 func Get() Distro {
-	if runtime.GOOS == "linux" {
-		return linuxDistro()
+	d, ok := distroAtomic.Load().(Distro)
+	if ok {
+		return d
 	}
-	if runtime.GOOS == "freebsd" {
-		return freebsdDistro()
+	switch runtime.GOOS {
+	case "linux":
+		d = linuxDistro()
+	case "freebsd":
+		d = freebsdDistro()
 	}
-	return ""
+	distroAtomic.Store(d) // even if empty
+	return d
 }
 
 func have(file string) bool {
@@ -62,6 +72,12 @@ func linuxDistro() Distro {
 		return NixOS
 	case have("/etc/config/uLinux.conf"):
 		return QNAP
+	case haveDir("/gokrazy"):
+		return Gokrazy
+	case have("/usr/local/wdmcserver/bin/wdmc.xml"): // Western Digital MyCloud OS3
+		return WDMyCloud
+	case have("/usr/sbin/wd_crontab.sh"): // Western Digital MyCloud OS5
+		return WDMyCloud
 	}
 	return ""
 }

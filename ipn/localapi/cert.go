@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !ios && !android
-// +build !ios,!android
+//go:build !ios && !android && !js
+// +build !ios,!android,!js
 
 package localapi
 
@@ -85,7 +85,7 @@ func (h *Handler) serveCert(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	logf := logger.WithPrefix(h.logf, fmt.Sprintf("cert(%q): ", domain))
-	traceACME := func(v interface{}) {
+	traceACME := func(v any) {
 		if !acmeDebug {
 			return
 		}
@@ -164,7 +164,7 @@ func (h *Handler) getCertPEMCached(dir, domain string, now time.Time) (p *keyPai
 	return nil, false
 }
 
-func (h *Handler) getCertPEM(ctx context.Context, logf logger.Logf, traceACME func(interface{}), dir, domain string, now time.Time) (*keyPair, error) {
+func (h *Handler) getCertPEM(ctx context.Context, logf logger.Logf, traceACME func(any), dir, domain string, now time.Time) (*keyPair, error) {
 	acmeMu.Lock()
 	defer acmeMu.Unlock()
 

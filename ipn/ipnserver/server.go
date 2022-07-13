@@ -36,12 +36,10 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
-	"tailscale.com/ipn/store/aws"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netstat"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsdial"
-	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
@@ -53,6 +51,7 @@ import (
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/monitor"
+	"tailscale.com/wgengine/netstack"
 )
 
 // Options is the configuration of the Tailscale node agent.
@@ -657,80 +656,11 @@ func (s *Server) writeToClients(n ipn.Notify) {
 	}
 }
 
-// tryWindowsAppDataMigration attempts to copy the Windows state file
-// from its old location to the new location. (Issue 2856)
-//
-// Tailscale 1.14 and before stored state under %LocalAppData%
-// (usually "C:\WINDOWS\system32\config\systemprofile\AppData\Local"
-// when tailscaled.exe is running as a non-user system service).
-// However it is frequently cleared for almost any reason: Windows
-// updates, System Restore, even various System Cleaner utilities.
-//
-// Returns a string of the path to use for the state file.
-// This will be a fallback %LocalAppData% path if migration fails,
-// a %ProgramData% path otherwise.
-func tryWindowsAppDataMigration(logf logger.Logf, path string) string {
-	if path != paths.DefaultTailscaledStateFile() {
-		// If they're specifying a non-default path, just trust that they know
-		// what they are doing.
-		return path
-	}
-	oldFile := paths.LegacyStateFilePath()
-	return paths.TryConfigFileMigration(logf, oldFile, path)
-}
-
-// StateStore returns a StateStore from path.
-//
-// The path should be an absolute path to a file.
-//
-// Special cases:
-//
-//   * empty string means to use an in-memory store
-//   * if the string begins with "mem:", the suffix
-//     is ignored and an in-memory store is used.
-//   * if the string begins with "kube:", the suffix
-//     is a Kubernetes secret name
-//   * if the string begins with "arn:", the value is
-//     an AWS ARN for an SSM.
-func StateStore(path string, logf logger.Logf) (ipn.StateStore, error) {
-	if path == "" {
-		return &ipn.MemoryStore{}, nil
-	}
-	const memPrefix = "mem:"
-	const kubePrefix = "kube:"
-	const arnPrefix = "arn:"
-	switch {
-	case strings.HasPrefix(path, memPrefix):
-		return &ipn.MemoryStore{}, nil
-	case strings.HasPrefix(path, kubePrefix):
-		secretName := strings.TrimPrefix(path, kubePrefix)
-		store, err := ipn.NewKubeStore(secretName)
-		if err != nil {
-			return nil, fmt.Errorf("ipn.NewKubeStore(%q): %v", secretName, err)
-		}
-		return store, nil
-	case strings.HasPrefix(path, arnPrefix):
-		store, err := aws.NewStore(path)
-		if err != nil {
-			return nil, fmt.Errorf("aws.NewStore(%q): %v", path, err)
-		}
-		return store, nil
-	}
-	if runtime.GOOS == "windows" {
-		path = tryWindowsAppDataMigration(logf, path)
-	}
-	store, err := ipn.NewFileStore(path)
-	if err != nil {
-		return nil, fmt.Errorf("ipn.NewFileStore(%q): %v", path, err)
-	}
-	return store, nil
-}
-
 // Run runs a Tailscale backend service.
 // The getEngine func is called repeatedly, once per connection, until it returns an engine successfully.
 //
 // Deprecated: use New and Server.Run instead.
-func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.StateStore, linkMon *monitor.Mon, dialer *tsdial.Dialer, logid string, getEngine func() (wgengine.Engine, error), opts Options) error {
+func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.StateStore, linkMon *monitor.Mon, dialer *tsdial.Dialer, logid string, getEngine func() (wgengine.Engine, *netstack.Impl, error), opts Options) error {
 	getEngine = getEngineUntilItWorksWrapper(getEngine)
 	runDone := make(chan struct{})
 	defer close(runDone)
@@ -777,7 +707,7 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 	bo := backoff.NewBackoff("ipnserver", logf, 30*time.Second)
 	var unservedConn net.Conn // if non-nil, accepted, but hasn't served yet
 
-	eng, err := getEngine()
+	eng, ns, err := getEngine()
 	if err != nil {
 		logf("ipnserver: initial getEngine call: %v", err)
 		for i := 1; ctx.Err() == nil; i++ {
@@ -788,7 +718,7 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 				continue
 			}
 			logf("ipnserver: try%d: trying getEngine again...", i)
-			eng, err = getEngine()
+			eng, ns, err = getEngine()
 			if err == nil {
 				logf("%d: GetEngine worked; exiting failure loop", i)
 				unservedConn = c
@@ -817,6 +747,9 @@ func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.State
 	server, err := New(logf, logid, store, eng, dialer, serverModeUser, opts)
 	if err != nil {
 		return err
+	}
+	if ns != nil {
+		ns.SetLocalBackend(server.LocalBackend())
 	}
 	serverMu.Lock()
 	serverOrNil = server
@@ -1067,29 +1000,26 @@ func BabysitProc(ctx context.Context, args []string, logf logger.Logf) {
 	}
 }
 
-// FixedEngine returns a func that returns eng and a nil error.
-func FixedEngine(eng wgengine.Engine) func() (wgengine.Engine, error) {
-	return func() (wgengine.Engine, error) { return eng, nil }
-}
-
 // getEngineUntilItWorksWrapper returns a getEngine wrapper that does
 // not call getEngine concurrently and stops calling getEngine once
 // it's returned a working engine.
-func getEngineUntilItWorksWrapper(getEngine func() (wgengine.Engine, error)) func() (wgengine.Engine, error) {
+func getEngineUntilItWorksWrapper(getEngine func() (wgengine.Engine, *netstack.Impl, error)) func() (wgengine.Engine, *netstack.Impl, error) {
 	var mu sync.Mutex
 	var engGood wgengine.Engine
-	return func() (wgengine.Engine, error) {
+	var nsGood *netstack.Impl
+	return func() (wgengine.Engine, *netstack.Impl, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if engGood != nil {
-			return engGood, nil
+			return engGood, nsGood, nil
 		}
-		e, err := getEngine()
+		e, ns, err := getEngine()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		engGood = e
-		return e, nil
+		nsGood = ns
+		return e, ns, nil
 	}
 }
 
@@ -1250,7 +1180,7 @@ func loadExtraEnv() (env []string, err error) {
 		if line == "" || line[0] == '#' {
 			continue
 		}
-		k, v, ok := stringsCut(line, "=")
+		k, v, ok := strings.Cut(line, "=")
 		if !ok || k == "" {
 			continue
 		}
@@ -1266,13 +1196,4 @@ func loadExtraEnv() (env []string, err error) {
 		}
 	}
 	return env, nil
-}
-
-// stringsCut is Go 1.18's strings.Cut.
-// TODO(bradfitz): delete this when we depend on Go 1.18.
-func stringsCut(s, sep string) (before, after string, found bool) {
-	if i := strings.Index(s, sep); i >= 0 {
-		return s[:i], s[i+len(sep):], true
-	}
-	return s, "", false
 }

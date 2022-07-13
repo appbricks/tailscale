@@ -48,6 +48,7 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/version"
+	"tailscale.com/version/distro"
 )
 
 var getLogTargetOnce struct {
@@ -426,7 +427,7 @@ func New(collection string) *Policy {
 	// ***********************
 
 	var earlyErrBuf bytes.Buffer
-	earlyLogf := func(format string, a ...interface{}) {
+	earlyLogf := func(format string, a ...any) {
 		fmt.Fprintf(&earlyErrBuf, format, a...)
 		earlyErrBuf.WriteByte('\n')
 	}
@@ -529,6 +530,8 @@ func New(collection string) *Policy {
 	}
 	if collection == logtail.CollectionNode {
 		c.MetricsDelta = clientmetric.EncodeLogTailMetricsDelta
+		c.IncludeProcID = true
+		c.IncludeProcSequence = true
 	}
 
 	if val := getLogTarget(); val != "" {
@@ -538,9 +541,25 @@ func New(collection string) *Policy {
 		c.HTTPC = &http.Client{Transport: NewLogtailTransport(u.Host)}
 	}
 
-	filchBuf, filchErr := filch.New(filepath.Join(dir, cmdName), filch.Options{
+	filchOptions := filch.Options{
 		ReplaceStderr: redirectStderrToLogPanics(),
-	})
+	}
+	filchPrefix := filepath.Join(dir, cmdName)
+
+	// Synology disks cannot hibernate if we're writing logs to them all the time.
+	// https://github.com/tailscale/tailscale/issues/3551
+	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
+		synologyTmpfsLogs := "/tmp/tailscale-logs"
+		if err := os.MkdirAll(synologyTmpfsLogs, 0755); err == nil {
+			filchPrefix = filepath.Join(synologyTmpfsLogs, cmdName)
+			filchOptions.MaxFileSize = 1 << 20
+		} else {
+			// not a fatal error, we can leave the log files on the spinning disk
+			log.Printf("Unable to create /tmp directory for log storage: %v\n", err)
+		}
+	}
+
+	filchBuf, filchErr := filch.New(filchPrefix, filchOptions)
 	if filchBuf != nil {
 		c.Buffer = filchBuf
 		if filchBuf.OrigStderr != nil {

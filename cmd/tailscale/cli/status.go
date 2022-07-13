@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -18,7 +19,6 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"github.com/toqueteos/webbrowser"
 	"inet.af/netaddr"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/interfaces"
@@ -69,7 +69,14 @@ var statusArgs struct {
 }
 
 func runStatus(ctx context.Context, args []string) error {
-	st, err := tailscale.Status(ctx)
+	if len(args) > 0 {
+		return errors.New("unexpected non-flag arguments to 'tailscale status'")
+	}
+	getStatus := localClient.Status
+	if !statusArgs.peers {
+		getStatus = localClient.StatusWithoutPeers
+	}
+	st, err := getStatus(ctx)
 	if err != nil {
 		return fixTailscaledConnectError(err)
 	}
@@ -107,7 +114,7 @@ func runStatus(ctx context.Context, args []string) error {
 				http.NotFound(w, r)
 				return
 			}
-			st, err := tailscale.Status(ctx)
+			st, err := localClient.Status(ctx)
 			if err != nil {
 				http.Error(w, err.Error(), 500)
 				return
@@ -121,12 +128,8 @@ func runStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
-	description, ok := isRunningOrStarting(st)
-	if !ok {
-		outln(description)
-		os.Exit(1)
-	}
-
+	// print health check information prior to checking LocalBackend state as
+	// it may provide an explanation to the user if we choose to exit early
 	if len(st.Health) > 0 {
 		printf("# Health check:\n")
 		for _, m := range st.Health {
@@ -135,8 +138,14 @@ func runStatus(ctx context.Context, args []string) error {
 		outln()
 	}
 
+	description, ok := isRunningOrStarting(st)
+	if !ok {
+		outln(description)
+		os.Exit(1)
+	}
+
 	var buf bytes.Buffer
-	f := func(format string, a ...interface{}) { fmt.Fprintf(&buf, format, a...) }
+	f := func(format string, a ...any) { fmt.Fprintf(&buf, format, a...) }
 	printPS := func(ps *ipnstate.PeerStatus) {
 		f("%-15s %-20s %-12s %-7s ",
 			firstIPString(ps.TailscaleIPs),

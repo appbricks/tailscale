@@ -6,12 +6,14 @@
 package localapi
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -26,6 +28,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
@@ -106,8 +109,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStatus(w, r)
 	case "/localapi/v0/logout":
 		h.serveLogout(w, r)
+	case "/localapi/v0/login-interactive":
+		h.serveLoginInteractive(w, r)
 	case "/localapi/v0/prefs":
 		h.servePrefs(w, r)
+	case "/localapi/v0/ping":
+		h.servePing(w, r)
+	case "/localapi/v0/check-prefs":
+		h.serveCheckPrefs(w, r)
 	case "/localapi/v0/check-ip-forwarding":
 		h.serveCheckIPForwarding(w, r)
 	case "/localapi/v0/bugreport":
@@ -122,10 +131,60 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveMetrics(w, r)
 	case "/localapi/v0/debug":
 		h.serveDebug(w, r)
+	case "/localapi/v0/set-expiry-sooner":
+		h.serveSetExpirySooner(w, r)
+	case "/localapi/v0/dial":
+		h.serveDial(w, r)
+	case "/localapi/v0/id-token":
+		h.serveIDToken(w, r)
 	case "/":
 		io.WriteString(w, "tailscaled\n")
 	default:
 		http.Error(w, "404 not found", 404)
+	}
+}
+
+// serveIDToken handles requests to get an OIDC ID token.
+func (h *Handler) serveIDToken(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "id-token access denied", http.StatusForbidden)
+		return
+	}
+	nm := h.b.NetMap()
+	if nm == nil {
+		http.Error(w, "no netmap", http.StatusServiceUnavailable)
+		return
+	}
+	aud := strings.TrimSpace(r.FormValue("aud"))
+	if len(aud) == 0 {
+		http.Error(w, "no audience requested", http.StatusBadRequest)
+		return
+	}
+	req := &tailcfg.TokenRequest{
+		CapVersion: tailcfg.CurrentCapabilityVersion,
+		Audience:   aud,
+		NodeKey:    nm.NodeKey,
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	httpReq, err := http.NewRequest("POST", "https://unused/machine/id-token", bytes.NewReader(b))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	resp, err := h.b.DoNoiseRequest(httpReq)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
 }
 
@@ -170,6 +229,7 @@ func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
 	res := &apitype.WhoIsResponse{
 		Node:        n,
 		UserProfile: &u,
+		Caps:        b.PeerCaps(ipp.IP()),
 	}
 	j, err := json.MarshalIndent(res, "", "\t")
 	if err != nil {
@@ -285,6 +345,20 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 	e.Encode(st)
 }
 
+func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "login access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "want POST", 400)
+		return
+	}
+	h.b.StartLoginInteractive()
+	w.WriteHeader(http.StatusNoContent)
+	return
+}
+
 func (h *Handler) serveLogout(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "logout access denied", http.StatusForbidden)
@@ -322,7 +396,9 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 		var err error
 		prefs, err = h.b.EditPrefs(mp)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(resJSON{Error: err.Error()})
 			return
 		}
 	case "GET", "HEAD":
@@ -335,6 +411,33 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 	e := json.NewEncoder(w)
 	e.SetIndent("", "\t")
 	e.Encode(prefs)
+}
+
+type resJSON struct {
+	Error string `json:",omitempty"`
+}
+
+func (h *Handler) serveCheckPrefs(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "checkprefs access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	p := new(ipn.Prefs)
+	if err := json.NewDecoder(r.Body).Decode(p); err != nil {
+		http.Error(w, "invalid JSON body", 400)
+		return
+	}
+	err := h.b.CheckPrefs(p)
+	var res resJSON
+	if err != nil {
+		res.Error = err.Error()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
 }
 
 func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request) {
@@ -446,12 +549,12 @@ func (h *Handler) serveFilePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upath := strings.TrimPrefix(r.URL.EscapedPath(), "/localapi/v0/file-put/")
-	slash := strings.Index(upath, "/")
-	if slash == -1 {
+	stableIDStr, filenameEscaped, ok := strings.Cut(upath, "/")
+	if !ok {
 		http.Error(w, "bogus URL", 400)
 		return
 	}
-	stableID, filenameEscaped := tailcfg.StableNodeID(upath[:slash]), upath[slash+1:]
+	stableID := tailcfg.StableNodeID(stableIDStr)
 
 	var ft *apitype.FileTarget
 	for _, x := range fts {
@@ -511,6 +614,122 @@ func (h *Handler) serveDERPMap(w http.ResponseWriter, r *http.Request) {
 	e.Encode(h.b.DERPMap())
 }
 
+// serveSetExpirySooner sets the expiry date on the current machine, specified
+// by an `expiry` unix timestamp as POST or query param.
+func (h *Handler) serveSetExpirySooner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var expiryTime time.Time
+	if v := r.FormValue("expiry"); v != "" {
+		expiryInt, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, "can't parse expiry time, expects a unix timestamp", http.StatusBadRequest)
+			return
+		}
+		expiryTime = time.Unix(expiryInt, 0)
+	} else {
+		http.Error(w, "missing 'expiry' parameter, a unix timestamp", http.StatusBadRequest)
+		return
+	}
+	err := h.b.SetExpirySooner(r.Context(), expiryTime)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	io.WriteString(w, "done\n")
+}
+
+func (h *Handler) servePing(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if r.Method != "POST" {
+		http.Error(w, "want POST", 400)
+		return
+	}
+	ipStr := r.FormValue("ip")
+	if ipStr == "" {
+		http.Error(w, "missing 'ip' parameter", 400)
+		return
+	}
+	ip, err := netaddr.ParseIP(ipStr)
+	if err != nil {
+		http.Error(w, "invalid IP", 400)
+		return
+	}
+	pingTypeStr := r.FormValue("type")
+	if ipStr == "" {
+		http.Error(w, "missing 'type' parameter", 400)
+		return
+	}
+	res, err := h.b.Ping(ctx, ip, tailcfg.PingType(pingTypeStr))
+	if err != nil {
+		writeErrorJSON(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+func (h *Handler) serveDial(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	const upgradeProto = "ts-dial"
+	if !strings.Contains(r.Header.Get("Connection"), "upgrade") ||
+		r.Header.Get("Upgrade") != upgradeProto {
+		http.Error(w, "bad ts-dial upgrade", http.StatusBadRequest)
+		return
+	}
+	hostStr, portStr := r.Header.Get("Dial-Host"), r.Header.Get("Dial-Port")
+	if hostStr == "" || portStr == "" {
+		http.Error(w, "missing Dial-Host or Dial-Port header", http.StatusBadRequest)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "make request over HTTP/1", http.StatusBadRequest)
+		return
+	}
+
+	addr := net.JoinHostPort(hostStr, portStr)
+	outConn, err := h.b.Dialer().UserDial(r.Context(), "tcp", addr)
+	if err != nil {
+		http.Error(w, "dial failure: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer outConn.Close()
+
+	w.Header().Set("Upgrade", upgradeProto)
+	w.Header().Set("Connection", "upgrade")
+	w.WriteHeader(http.StatusSwitchingProtocols)
+
+	reqConn, brw, err := hijacker.Hijack()
+	if err != nil {
+		h.logf("localapi dial Hijack error: %v", err)
+		return
+	}
+	defer reqConn.Close()
+	if err := brw.Flush(); err != nil {
+		return
+	}
+	reqConn = netutil.NewDrainBufConn(reqConn, brw.Reader)
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(reqConn, outConn)
+		errc <- err
+	}()
+	go func() {
+		_, err := io.Copy(outConn, reqConn)
+		errc <- err
+	}()
+	<-errc
+}
+
 func defBool(a string, def bool) bool {
 	if a == "" {
 		return def
@@ -526,7 +745,7 @@ func defBool(a string, def bool) bool {
 // (currently only a slice or a map) and makes sure it's non-nil for
 // JSON serialization. (In particular, JavaScript clients usually want
 // the field to be defined after they decode the JSON.)
-func makeNonNil(ptr interface{}) {
+func makeNonNil(ptr any) {
 	if ptr == nil {
 		panic("nil interface")
 	}

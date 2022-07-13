@@ -434,38 +434,27 @@ func (q *Parsed) IsEchoResponse() bool {
 	}
 }
 
-// RemoveECNBits modifies p and its underlying memory buffer to remove
-// ECN bits, if any. It reports whether it did so.
-//
-// It currently only does the TCP flags.
-func (p *Parsed) RemoveECNBits() bool {
-	if p.IPVersion == 0 {
-		return false
+// EchoIDSeq extracts the identifier/sequence bytes from an ICMP Echo response,
+// and returns them as a uint32, used to lookup internally routed ICMP echo
+// responses. This function is intentionally lightweight as it is called on
+// every incoming ICMP packet.
+func (q *Parsed) EchoIDSeq() uint32 {
+	switch q.IPProto {
+	case ipproto.ICMPv4:
+		offset := ip4HeaderLength + icmp4HeaderLength
+		if len(q.b) < offset+4 {
+			return 0
+		}
+		return binary.LittleEndian.Uint32(q.b[offset:])
+	case ipproto.ICMPv6:
+		offset := ip6HeaderLength + icmp6HeaderLength
+		if len(q.b) < offset+4 {
+			return 0
+		}
+		return binary.LittleEndian.Uint32(q.b[offset:])
+	default:
+		return 0
 	}
-	if p.IPProto != ipproto.TCP {
-		// TODO(bradfitz): handle non-TCP too? for now only trying to
-		// fix the Issue 2642 problem.
-		return false
-	}
-	if p.TCPFlags&TCPECNBits == 0 {
-		// Nothing to do.
-		return false
-	}
-
-	// Clear flags.
-
-	// First in the parsed output.
-	p.TCPFlags = p.TCPFlags & ^TCPECNBits
-
-	// Then in the underlying memory.
-	tcp := p.Transport()
-	old := binary.BigEndian.Uint16(tcp[12:14])
-	tcp[13] = byte(p.TCPFlags)
-	new := binary.BigEndian.Uint16(tcp[12:14])
-	oldSum := binary.BigEndian.Uint16(tcp[16:18])
-	newSum := ^checksumUpdate2ByteAlignedUint16(^oldSum, old, new)
-	binary.BigEndian.PutUint16(tcp[16:18], newSum)
-	return true
 }
 
 func Hexdump(b []byte) string {
@@ -498,27 +487,4 @@ func Hexdump(b []byte) string {
 		}
 	}
 	return out.String()
-}
-
-// From gVisor's unexported API:
-
-// checksumUpdate2ByteAlignedUint16 updates a uint16 value in a calculated
-// checksum.
-//
-// The value MUST begin at a 2-byte boundary in the original buffer.
-func checksumUpdate2ByteAlignedUint16(xsum, old, new uint16) uint16 {
-	// As per RFC 1071 page 4,
-	//(4)  Incremental Update
-	//
-	//        ...
-	//
-	//        To update the checksum, simply add the differences of the
-	//        sixteen bit integers that have been changed.  To see why this
-	//        works, observe that every 16-bit integer has an additive inverse
-	//        and that addition is associative.  From this it follows that
-	//        given the original value m, the new value m', and the old
-	//        checksum C, the new checksum C' is:
-	//
-	//                C' = C + (-m) + m' = C + (m' - m)
-	return checksumCombine(xsum, checksumCombine(new, ^old))
 }

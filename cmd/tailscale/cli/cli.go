@@ -25,6 +25,7 @@ import (
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
@@ -35,7 +36,7 @@ import (
 var Stderr io.Writer = os.Stderr
 var Stdout io.Writer = os.Stdout
 
-func printf(format string, a ...interface{}) {
+func printf(format string, a ...any) {
 	fmt.Fprintf(Stdout, format, a...)
 }
 
@@ -44,7 +45,7 @@ func printf(format string, a ...interface{}) {
 //
 // It's not named println because that looks like the Go built-in
 // which goes to stderr and formats slightly differently.
-func outln(a ...interface{}) {
+func outln(a ...any) {
 	fmt.Fprintln(Stdout, a...)
 }
 
@@ -124,8 +125,10 @@ func CleanUpArgs(args []string) []string {
 	return out
 }
 
+var localClient tailscale.LocalClient
+
 // Run runs the CLI. The args do not include the binary name.
-func Run(args []string) error {
+func Run(args []string) (err error) {
 	if len(args) == 1 && (args[0] == "-V" || args[0] == "--version") {
 		args = []string{"version"}
 	}
@@ -158,6 +161,8 @@ change in the future.
 			ipCmd,
 			statusCmd,
 			pingCmd,
+			ncCmd,
+			sshCmd,
 			versionCmd,
 			webCmd,
 			fileCmd,
@@ -170,6 +175,9 @@ change in the future.
 	}
 	for _, c := range rootCmd.Subcommands {
 		c.UsageFunc = usageFunc
+	}
+	if envknob.UseWIPCode() {
+		rootCmd.Subcommands = append(rootCmd.Subcommands, idTokenCmd)
 	}
 
 	// Don't advertise the debug command, but it exists.
@@ -187,14 +195,14 @@ change in the future.
 		return err
 	}
 
-	tailscale.TailscaledSocket = rootArgs.socket
+	localClient.Socket = rootArgs.socket
 	rootfs.Visit(func(f *flag.Flag) {
 		if f.Name == "socket" {
-			tailscale.TailscaledSocketSetExplicitly = true
+			localClient.UseSocketOnly = true
 		}
 	})
 
-	err := rootCmd.Run(context.Background())
+	err = rootCmd.Run(context.Background())
 	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
 		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s' or 'tailscale up --operator=$USER' to not require root.", err, strings.Join(args, " "))
 	}
@@ -204,7 +212,7 @@ change in the future.
 	return err
 }
 
-func fatalf(format string, a ...interface{}) {
+func fatalf(format string, a ...any) {
 	if Fatalf != nil {
 		Fatalf(format, a...)
 		return
@@ -214,7 +222,7 @@ func fatalf(format string, a ...interface{}) {
 }
 
 // Fatalf, if non-nil, is used instead of log.Fatalf.
-var Fatalf func(format string, a ...interface{})
+var Fatalf func(format string, a ...any)
 
 var rootArgs struct {
 	socket string

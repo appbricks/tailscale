@@ -28,7 +28,6 @@ import (
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"inet.af/netaddr"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/preftype"
@@ -269,15 +268,14 @@ func synoTokenRedirect(w http.ResponseWriter, r *http.Request) bool {
 	}
 	// We need a SynoToken for authenticate.cgi.
 	// So we tell the client to get one.
-	serverURL := r.URL.Scheme + "://" + r.URL.Host
-	synoTokenRedirectHTML.Execute(w, serverURL)
+	_, _ = fmt.Fprint(w, synoTokenRedirectHTML)
 	return true
 }
 
-var synoTokenRedirectHTML = template.Must(template.New("redirect").Parse(`<html><body>
+const synoTokenRedirectHTML = `<html><body>
 Redirecting with session token...
 <script>
-var serverURL = {{ . }};
+var serverURL = window.location.protocol + "//" + window.location.host;
 var req = new XMLHttpRequest();
 req.overrideMimeType("application/json");
 req.open("GET", serverURL + "/webman/login.cgi", true);
@@ -289,7 +287,7 @@ req.onload = function() {
 req.send(null);
 </script>
 </body></html>
-`))
+`
 
 func webHandler(w http.ResponseWriter, r *http.Request) {
 	if authRedirect(w, r) {
@@ -313,13 +311,13 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 			AdvertiseExitNode bool
 			Reauthenticate    bool
 		}
-		type mi map[string]interface{}
+		type mi map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&postData); err != nil {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(mi{"error": err.Error()})
 			return
 		}
-		prefs, err := tailscale.GetPrefs(r.Context())
+		prefs, err := localClient.GetPrefs(r.Context())
 		if err != nil && !postData.Reauthenticate {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(mi{"error": err.Error()})
@@ -349,12 +347,12 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	st, err := tailscale.Status(r.Context())
+	st, err := localClient.Status(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	prefs, err := tailscale.GetPrefs(r.Context())
+	prefs, err := localClient.GetPrefs(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -407,7 +405,7 @@ func tailscaleUp(ctx context.Context, prefs *ipn.Prefs, forceReauth bool) (authU
 		prefs.NetfilterMode = preftype.NetfilterOff
 	}
 
-	st, err := tailscale.Status(ctx)
+	st, err := localClient.Status(ctx)
 	if err != nil {
 		return "", fmt.Errorf("can't fetch status: %v", err)
 	}

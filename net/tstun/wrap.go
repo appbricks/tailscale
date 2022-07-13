@@ -19,6 +19,7 @@ import (
 	"go4.org/mem"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"inet.af/netaddr"
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
@@ -60,7 +61,7 @@ var (
 // parsedPacketPool holds a pool of Parsed structs for use in filtering.
 // This is needed because escape analysis cannot see that parsed packets
 // do not escape through {Pre,Post}Filter{In,Out}.
-var parsedPacketPool = sync.Pool{New: func() interface{} { return new(packet.Parsed) }}
+var parsedPacketPool = sync.Pool{New: func() any { return new(packet.Parsed) }}
 
 // FilterFunc is a packet-filtering function with access to the Wrapper device.
 // It must not hold onto the packet struct, as its backing storage will be reused.
@@ -109,9 +110,9 @@ type Wrapper struct {
 	// inbound packets arrive via UDP and are written into the TUN device;
 	// outbound packets are read from the TUN device and sent out via UDP.
 	// This queue is needed because although inbound writes are synchronous,
-	// the other direction must wait on a Wireguard goroutine to poll it.
+	// the other direction must wait on a WireGuard goroutine to poll it.
 	//
-	// Empty reads are skipped by Wireguard, so it is always legal
+	// Empty reads are skipped by WireGuard, so it is always legal
 	// to discard an empty packet instead of sending it through t.outbound.
 	//
 	// Close closes outbound. There may be outstanding sends to outbound
@@ -134,14 +135,26 @@ type Wrapper struct {
 	PreFilterIn FilterFunc
 	// PostFilterIn is the inbound filter function that runs after the main filter.
 	PostFilterIn FilterFunc
-	// PreFilterOut is the outbound filter function that runs before the main filter
-	// and therefore sees the packets that may be later dropped by it.
-	PreFilterOut FilterFunc
+	// PreFilterFromTunToNetstack is a filter function that runs before the main filter
+	// for packets from the local system. This filter is populated by netstack to hook
+	// packets that should be handled by netstack. If set, this filter runs before
+	// PreFilterFromTunToEngine.
+	PreFilterFromTunToNetstack FilterFunc
+	// PreFilterFromTunToEngine is a filter function that runs before the main filter
+	// for packets from the local system. This filter is populated by wgengine to hook
+	// packets which it handles internally. If both this and PreFilterFromTunToNetstack
+	// filter functions are non-nil, this filter runs second.
+	PreFilterFromTunToEngine FilterFunc
 	// PostFilterOut is the outbound filter function that runs after the main filter.
 	PostFilterOut FilterFunc
 
 	// OnTSMPPongReceived, if non-nil, is called whenever a TSMP pong arrives.
 	OnTSMPPongReceived func(packet.TSMPPongReply)
+
+	// OnICMPEchoResponseReceived, if non-nil, is called whenever a ICMP echo response
+	// arrives. If the packet is to be handled internally this returns true,
+	// false otherwise.
+	OnICMPEchoResponseReceived func(*packet.Parsed) bool
 
 	// PeerAPIPort, if non-nil, returns the peerapi port that's
 	// running for the given IP address.
@@ -154,12 +167,19 @@ type Wrapper struct {
 	disableTSMPRejected bool
 }
 
-// tunReadResult is the result of a TUN read: Some data and an error.
-// The byte slice is not interpreted in the usual way for a Read method.
+// tunReadResult is the result of a TUN read, or an injected result pretending to be a TUN read.
+// The data is not interpreted in the usual way for a Read method.
 // See the comment in the middle of Wrap.Read.
 type tunReadResult struct {
-	data []byte
-	err  error
+	// Only one of err, packet or data should be set, and are read in that order
+	// of precendence.
+	err    error
+	packet *stack.PacketBuffer
+	data   []byte
+
+	// injected is set if the read result was generated internally, and contained packets should not
+	// pass through filters.
+	injected bool
 }
 
 func WrapTAP(logf logger.Logf, tdev tun.Device) *Wrapper {
@@ -443,9 +463,16 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 		return filter.DropSilently
 	}
 
-	if t.PreFilterOut != nil {
-		if res := t.PreFilterOut(p, t); res.IsDrop() {
-			// Handled by userspaceEngine.handleLocalPackets (quad-100 DNS primarily).
+	if t.PreFilterFromTunToNetstack != nil {
+		if res := t.PreFilterFromTunToNetstack(p, t); res.IsDrop() {
+			// Handled by netstack.Impl.handleLocalPackets (quad-100 DNS primarily)
+			return res
+		}
+	}
+	if t.PreFilterFromTunToEngine != nil {
+		if res := t.PreFilterFromTunToEngine(p, t); res.IsDrop() {
+			// Handled by userspaceEngine.handleLocalPackets (primarily handles
+			// quad-100 if netstack is not installed).
 			return res
 		}
 	}
@@ -494,15 +521,22 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 	}
 
 	metricPacketOut.Add(1)
-	pkt := res.data
-	n := copy(buf[offset:], pkt)
-	// t.buffer has a fixed location in memory.
-	// If the packet is not from t.buffer, then it is an injected packet.
-	// &pkt[0] can be used because empty packets do not reach t.outbound.
-	isInjectedPacket := &pkt[0] != &t.buffer[PacketStartOffset]
-	if !isInjectedPacket {
-		// We are done with t.buffer. Let poll re-use it.
-		t.sendBufferConsumed()
+
+	var n int
+	if res.packet != nil {
+		n = copy(buf[offset:], res.packet.NetworkHeader().View())
+		n += copy(buf[offset+n:], res.packet.TransportHeader().View())
+		n += copy(buf[offset+n:], res.packet.Data().AsRange().AsView())
+
+		res.packet.DecRef()
+	} else {
+		n = copy(buf[offset:], res.data)
+
+		// t.buffer has a fixed location in memory.
+		if &res.data[0] == &t.buffer[PacketStartOffset] {
+			// We are done with t.buffer. Let poll re-use it.
+			t.sendBufferConsumed()
+		}
 	}
 
 	p := parsedPacketPool.Get().(*packet.Parsed)
@@ -516,11 +550,11 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 	}
 
 	// Do not filter injected packets.
-	if !isInjectedPacket && !t.disableFilter {
+	if !res.injected && !t.disableFilter {
 		response := t.filterOut(p)
 		if response != filter.Accept {
 			metricPacketOutDrop.Add(1)
-			// Wireguard considers read errors fatal; pretend nothing was read
+			// WireGuard considers read errors fatal; pretend nothing was read
 			return 0, nil
 		}
 	}
@@ -543,6 +577,14 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 			if f := t.OnTSMPPongReceived; f != nil {
 				f(data)
 			}
+		}
+	}
+
+	if p.IsEchoResponse() {
+		if f := t.OnICMPEchoResponseReceived; f != nil && f(p) {
+			// Note: this looks dropped in metrics, even though it was
+			// handled internally.
+			return filter.DropSilently
 		}
 	}
 
@@ -663,6 +705,27 @@ func (t *Wrapper) SetFilter(filt *filter.Filter) {
 	t.filter.Store(filt)
 }
 
+// InjectInboundPacketBuffer makes the Wrapper device behave as if a packet
+// with the given contents was received from the network.
+// It takes ownership of one reference count on the packet. The injected
+// packet will not pass through inbound filters.
+//
+// This path is typically used to deliver synthesized packets to the
+// host networking stack.
+func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer) error {
+	buf := make([]byte, PacketStartOffset+pkt.Size())
+
+	n := copy(buf[PacketStartOffset:], pkt.NetworkHeader().View())
+	n += copy(buf[PacketStartOffset+n:], pkt.TransportHeader().View())
+	n += copy(buf[PacketStartOffset+n:], pkt.Data().AsRange().AsView())
+	if n != pkt.Size() {
+		panic("unexpected packet size after copy")
+	}
+	pkt.DecRef()
+
+	return t.InjectInboundDirect(buf, PacketStartOffset)
+}
+
 // InjectInboundDirect makes the Wrapper device behave as if a packet
 // with the given contents was received from the network.
 // It blocks and does not take ownership of the packet.
@@ -670,7 +733,7 @@ func (t *Wrapper) SetFilter(filt *filter.Filter) {
 //
 // The packet contents are to start at &buf[offset].
 // offset must be greater or equal to PacketStartOffset.
-// The space before &buf[offset] will be used by Wireguard.
+// The space before &buf[offset] will be used by WireGuard.
 func (t *Wrapper) InjectInboundDirect(buf []byte, offset int) error {
 	if len(buf) > MaxPacketSize {
 		return errPacketTooBig
@@ -741,7 +804,24 @@ func (t *Wrapper) InjectOutbound(packet []byte) error {
 	if len(packet) == 0 {
 		return nil
 	}
-	t.sendOutbound(tunReadResult{data: packet})
+	t.sendOutbound(tunReadResult{data: packet, injected: true})
+	return nil
+}
+
+// InjectOutboundPacketBuffer logically behaves as InjectOutbound. It takes ownership of one
+// reference count on the packet, and the packet may be mutated. The packet refcount will be
+// decremented after the injected buffer has been read.
+func (t *Wrapper) InjectOutboundPacketBuffer(packet *stack.PacketBuffer) error {
+	size := packet.Size()
+	if size > MaxPacketSize {
+		packet.DecRef()
+		return errPacketTooBig
+	}
+	if size == 0 {
+		packet.DecRef()
+		return nil
+	}
+	t.sendOutbound(tunReadResult{packet: packet, injected: true})
 	return nil
 }
 
@@ -751,13 +831,13 @@ func (t *Wrapper) Unwrap() tun.Device {
 }
 
 var (
-	metricPacketIn              = clientmetric.NewGauge("tstun_in_from_wg")
-	metricPacketInDrop          = clientmetric.NewGauge("tstun_in_from_wg_drop")
-	metricPacketInDropFilter    = clientmetric.NewGauge("tstun_in_from_wg_drop_filter")
-	metricPacketInDropSelfDisco = clientmetric.NewGauge("tstun_in_from_wg_drop_self_disco")
+	metricPacketIn              = clientmetric.NewCounter("tstun_in_from_wg")
+	metricPacketInDrop          = clientmetric.NewCounter("tstun_in_from_wg_drop")
+	metricPacketInDropFilter    = clientmetric.NewCounter("tstun_in_from_wg_drop_filter")
+	metricPacketInDropSelfDisco = clientmetric.NewCounter("tstun_in_from_wg_drop_self_disco")
 
-	metricPacketOut              = clientmetric.NewGauge("tstun_out_to_wg")
-	metricPacketOutDrop          = clientmetric.NewGauge("tstun_out_to_wg_drop")
-	metricPacketOutDropFilter    = clientmetric.NewGauge("tstun_out_to_wg_drop_filter")
-	metricPacketOutDropSelfDisco = clientmetric.NewGauge("tstun_out_to_wg_drop_self_disco")
+	metricPacketOut              = clientmetric.NewCounter("tstun_out_to_wg")
+	metricPacketOutDrop          = clientmetric.NewCounter("tstun_out_to_wg_drop")
+	metricPacketOutDropFilter    = clientmetric.NewCounter("tstun_out_to_wg_drop_filter")
+	metricPacketOutDropSelfDisco = clientmetric.NewCounter("tstun_out_to_wg_drop_self_disco")
 )

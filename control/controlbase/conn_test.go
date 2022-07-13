@@ -13,16 +13,20 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	chp "golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/nettest"
 	tsnettest "tailscale.com/net/nettest"
 	"tailscale.com/types/key"
 )
+
+const testProtocolVersion = 1
 
 func TestMessageSize(t *testing.T) {
 	// This test is a regression guard against someone looking at
@@ -205,7 +209,7 @@ func TestConnStd(t *testing.T) {
 			c2, err = Server(context.Background(), s2, controlKey, nil)
 			serverErr <- err
 		}()
-		c1, err = Client(context.Background(), s1, machineKey, controlKey.Public())
+		c1, err = Client(context.Background(), s1, machineKey, controlKey.Public(), testProtocolVersion)
 		if err != nil {
 			s1.Close()
 			s2.Close()
@@ -222,6 +226,81 @@ func TestConnStd(t *testing.T) {
 			c2.Close()
 		}, nil
 	})
+}
+
+// tests that the idle memory overhead of a Conn blocked in a read is
+// reasonable (under 2K). It was previously over 8KB with two 4KB
+// buffers for rx/tx. This make sure we don't regress. Hopefully it
+// doesn't turn into a flaky test. If so, const max can be adjusted,
+// or it can be deleted or reworked.
+func TestConnMemoryOverhead(t *testing.T) {
+	num := 1000
+	if testing.Short() {
+		num = 100
+	}
+	ng0 := runtime.NumGoroutine()
+
+	runtime.GC()
+	var ms0 runtime.MemStats
+	runtime.ReadMemStats(&ms0)
+
+	var closers []io.Closer
+	closeAll := func() {
+		for _, c := range closers {
+			c.Close()
+		}
+		closers = nil
+	}
+	defer closeAll()
+
+	for i := 0; i < num; i++ {
+		client, server := pair(t)
+		closers = append(closers, client, server)
+		go func() {
+			var buf [1]byte
+			client.Read(buf[:])
+		}()
+	}
+
+	t0 := time.Now()
+	deadline := t0.Add(3 * time.Second)
+	var ngo int
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		ngo = runtime.NumGoroutine()
+		if ngo >= num {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ngo < num {
+		t.Fatalf("only %v goroutines; expected %v+", ngo, num)
+	}
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	growthTotal := int64(ms.HeapAlloc) - int64(ms0.HeapAlloc)
+	growthEach := float64(growthTotal) / float64(num)
+	t.Logf("Alloced %v bytes, %.2f B/each", growthTotal, growthEach)
+	const max = 2000
+	if growthEach > max {
+		t.Errorf("allocated more than expected; want max %v bytes/each", max)
+	}
+
+	closeAll()
+
+	// And make sure our goroutines go away too.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ngo = runtime.NumGoroutine()
+		if ngo < ng0+num/10 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ngo >= ng0+num/10 {
+		t.Errorf("goroutines didn't go back down; started at %v, now %v", ng0, ngo)
+	}
 }
 
 // mkConns creates synthetic Noise Conns wrapping the given net.Conns.
@@ -323,7 +402,7 @@ func pairWithConns(t *testing.T, clientConn, serverConn net.Conn) (*Conn, *Conn)
 		serverErr <- err
 	}()
 
-	client, err := Client(context.Background(), clientConn, machineKey, controlKey.Public())
+	client, err := Client(context.Background(), clientConn, machineKey, controlKey.Public(), testProtocolVersion)
 	if err != nil {
 		t.Fatalf("client connection failed: %v", err)
 	}

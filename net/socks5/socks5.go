@@ -95,7 +95,7 @@ func (s *Server) dial(ctx context.Context, network, addr string) (net.Conn, erro
 	return dial(ctx, network, addr)
 }
 
-func (s *Server) logf(format string, args ...interface{}) {
+func (s *Server) logf(format string, args ...any) {
 	logf := s.Logf
 	if logf == nil {
 		logf = log.Printf
@@ -112,11 +112,11 @@ func (s *Server) Serve(l net.Listener) error {
 			return err
 		}
 		go func() {
+			defer c.Close()
 			conn := &Conn{clientConn: c, srv: s}
 			err := conn.Run()
 			if err != nil {
 				s.logf("client connection failed: %v", err)
-				conn.clientConn.Close()
 			}
 		}()
 	}
