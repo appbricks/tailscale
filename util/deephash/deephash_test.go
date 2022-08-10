@@ -10,10 +10,15 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"math"
+	"math/rand"
 	"reflect"
 	"runtime"
 	"testing"
+	"testing/quick"
+	"time"
+	"unsafe"
 
 	"go4.org/mem"
 	"inet.af/netaddr"
@@ -21,6 +26,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
+	"tailscale.com/types/structs"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
@@ -56,6 +62,7 @@ func TestHash(t *testing.T) {
 	}
 	type MyBool bool
 	type MyHeader tar.Header
+	var zeroFloat64 float64
 	tests := []struct {
 		in     tuple
 		wantEq bool
@@ -97,6 +104,10 @@ func TestHash(t *testing.T) {
 		{in: tuple{iface{&MyHeader{}}, iface{&tar.Header{}}}, wantEq: false},
 		{in: tuple{iface{[]map[string]MyBool{}}, iface{[]map[string]MyBool{}}}, wantEq: true},
 		{in: tuple{iface{[]map[string]bool{}}, iface{[]map[string]MyBool{}}}, wantEq: false},
+		{in: tuple{zeroFloat64, -zeroFloat64}, wantEq: false}, // Issue 4883 (false alarm)
+		{in: tuple{[]any(nil), 0.0}, wantEq: false},           // Issue 4883
+		{in: tuple{[]any(nil), uint8(0)}, wantEq: false},      // Issue 4883
+		{in: tuple{nil, nil}, wantEq: true},                   // Issue 4883
 		{
 			in: func() tuple {
 				i1 := 1
@@ -112,7 +123,7 @@ func TestHash(t *testing.T) {
 	for _, tt := range tests {
 		gotEq := Hash(tt.in[0]) == Hash(tt.in[1])
 		if gotEq != tt.wantEq {
-			t.Errorf("(Hash(%v) == Hash(%v)) = %v, want %v", tt.in[0], tt.in[1], gotEq, tt.wantEq)
+			t.Errorf("(Hash(%T %v) == Hash(%T %v)) = %v, want %v", tt.in[0], tt.in[0], tt.in[1], tt.in[1], gotEq, tt.wantEq)
 		}
 	}
 }
@@ -129,6 +140,49 @@ func TestDeepHash(t *testing.T) {
 		if hash1 != hash2 {
 			t.Error("second hash didn't match")
 		}
+	}
+}
+
+// Tests that we actually hash map elements. Whoops.
+func TestIssue4868(t *testing.T) {
+	m1 := map[int]string{1: "foo"}
+	m2 := map[int]string{1: "bar"}
+	if Hash(m1) == Hash(m2) {
+		t.Error("bogus")
+	}
+}
+
+func TestIssue4871(t *testing.T) {
+	m1 := map[string]string{"": "", "x": "foo"}
+	m2 := map[string]string{}
+	if h1, h2 := Hash(m1), Hash(m2); h1 == h2 {
+		t.Errorf("bogus: h1=%x, h2=%x", h1, h2)
+	}
+}
+
+func TestNilVsEmptymap(t *testing.T) {
+	m1 := map[string]string(nil)
+	m2 := map[string]string{}
+	if h1, h2 := Hash(m1), Hash(m2); h1 == h2 {
+		t.Errorf("bogus: h1=%x, h2=%x", h1, h2)
+	}
+}
+
+func TestMapFraming(t *testing.T) {
+	m1 := map[string]string{"foo": "", "fo": "o"}
+	m2 := map[string]string{}
+	if h1, h2 := Hash(m1), Hash(m2); h1 == h2 {
+		t.Errorf("bogus: h1=%x, h2=%x", h1, h2)
+	}
+}
+
+func TestQuick(t *testing.T) {
+	initSeed()
+	err := quick.Check(func(v, w map[string]string) bool {
+		return (Hash(v) == Hash(w)) == reflect.DeepEqual(v, w)
+	}, &quick.Config{MaxCount: 1000, Rand: rand.New(rand.NewSource(int64(seed)))})
+	if err != nil {
+		t.Fatalf("seed=%v, err=%v", seed, err)
 	}
 }
 
@@ -226,6 +280,118 @@ func getVal() []any {
 	}
 }
 
+func TestTypeIsRecursive(t *testing.T) {
+	type RecursiveStruct struct {
+		v *RecursiveStruct
+	}
+	type RecursiveChan chan *RecursiveChan
+
+	tests := []struct {
+		val  any
+		want bool
+	}{
+		{val: 42, want: false},
+		{val: "string", want: false},
+		{val: 1 + 2i, want: false},
+		{val: struct{}{}, want: false},
+		{val: (*RecursiveStruct)(nil), want: true},
+		{val: RecursiveStruct{}, want: true},
+		{val: time.Unix(0, 0), want: false},
+		{val: structs.Incomparable{}, want: false}, // ignore its [0]func()
+		{val: tailcfg.NetPortRange{}, want: false}, // uses structs.Incomparable
+		{val: (*tailcfg.Node)(nil), want: false},
+		{val: map[string]bool{}, want: false},
+		{val: func() {}, want: false},
+		{val: make(chan int), want: false},
+		{val: unsafe.Pointer(nil), want: false},
+		{val: make(RecursiveChan), want: true},
+		{val: make(chan int), want: false},
+	}
+	for _, tt := range tests {
+		got := typeIsRecursive(reflect.TypeOf(tt.val))
+		if got != tt.want {
+			t.Errorf("for type %T: got %v, want %v", tt.val, got, tt.want)
+		}
+	}
+}
+
+type IntThenByte struct {
+	i int
+	b byte
+}
+
+type TwoInts struct{ a, b int }
+
+type IntIntByteInt struct {
+	i1, i2 int32
+	b      byte // padding after
+	i3     int32
+}
+
+func TestCanMemHash(t *testing.T) {
+	tests := []struct {
+		val  any
+		want bool
+	}{
+		{true, true},
+		{uint(1), true},
+		{uint8(1), true},
+		{uint16(1), true},
+		{uint32(1), true},
+		{uint64(1), true},
+		{uintptr(1), true},
+		{int(1), true},
+		{int8(1), true},
+		{int16(1), true},
+		{int32(1), true},
+		{int64(1), true},
+		{float32(1), true},
+		{float64(1), true},
+		{complex64(1), true},
+		{complex128(1), true},
+		{[32]byte{}, true},
+		{func() {}, false},
+		{make(chan int), false},
+		{struct{ io.Writer }{nil}, false},
+		{unsafe.Pointer(nil), false},
+		{new(int), false},
+		{TwoInts{}, true},
+		{[4]TwoInts{}, true},
+		{IntThenByte{}, false},
+		{[4]IntThenByte{}, false},
+		{tailcfg.PortRange{}, true},
+		{int16(0), true},
+		{struct {
+			_ int
+			_ int
+		}{}, true},
+		{struct {
+			_ int
+			_ uint8
+			_ int
+		}{}, false}, // gap
+		{
+			struct {
+				_ structs.Incomparable // if not last, zero-width
+				x int
+			}{},
+			true,
+		},
+		{
+			struct {
+				x int
+				_ structs.Incomparable // zero-width last: has space, can't memhash
+			}{},
+			false,
+		}}
+	for _, tt := range tests {
+		got := canMemHash(reflect.TypeOf(tt.val))
+		if got != tt.want {
+			t.Errorf("for type %T: got %v, want %v", tt.val, got, tt.want)
+		}
+	}
+}
+
 var sink = Hash("foo")
 
 func BenchmarkHash(b *testing.B) {
@@ -233,6 +399,57 @@ func BenchmarkHash(b *testing.B) {
 	v := getVal()
 	for i := 0; i < b.N; i++ {
 		sink = Hash(v)
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }
+
+// filterRules is a packet filter that has both everything populated (in its
+// first element) and also a few entries that are the typical shape for regular
+// packet filters as sent to clients.
+var filterRules = []tailcfg.FilterRule{
+	{
+		SrcIPs:  []string{"*", "10.1.3.4/32", "10.0.0.0/24"},
+		SrcBits: []int{1, 2, 3},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "1.2.3.4/32",
+			Bits:  ptrTo(32),
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+		IPProto: []int{1, 2, 3, 4},
+		CapGrant: []tailcfg.CapGrant{{
+			Dsts: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.2.3.4/32")},
+			Caps: []string{"foo"},
+		}},
+	},
+	{
+		SrcIPs: []string{"foooooooooo"},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "baaaaaarrrrr",
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+	},
+	{
+		SrcIPs: []string{"foooooooooo"},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "baaaaaarrrrr",
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+	},
+	{
+		SrcIPs: []string{"foooooooooo"},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "baaaaaarrrrr",
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+	},
+}
+
+func BenchmarkHashPacketFilter(b *testing.B) {
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		sink = Hash(filterRules)
 	}
 }
 
@@ -246,12 +463,14 @@ func TestHashMapAcyclic(t *testing.T) {
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
 
+	ti := getTypeInfo(reflect.TypeOf(m))
+
 	for i := 0; i < 20; i++ {
 		v := reflect.ValueOf(m)
 		buf.Reset()
 		bw.Reset(&buf)
 		h := &hasher{bw: bw}
-		h.hashMap(v)
+		h.hashMap(v, ti, false)
 		if got[string(buf.Bytes())] {
 			continue
 		}
@@ -270,7 +489,7 @@ func TestPrintArray(t *testing.T) {
 	var got bytes.Buffer
 	bw := bufio.NewWriter(&got)
 	h := &hasher{bw: bw}
-	h.hashValue(reflect.ValueOf(x))
+	h.hashValue(reflect.ValueOf(x), false)
 	bw.Flush()
 	const want = "\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f"
 	if got := got.Bytes(); string(got) != want {
@@ -288,13 +507,14 @@ func BenchmarkHashMapAcyclic(b *testing.B) {
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
 	v := reflect.ValueOf(m)
+	ti := getTypeInfo(v.Type())
 
 	h := &hasher{bw: bw}
 
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
 		bw.Reset(&buf)
-		h.hashMap(v)
+		h.hashMap(v, ti, false)
 	}
 }
 

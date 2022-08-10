@@ -32,7 +32,6 @@ type NetworkMap struct {
 	// Name is the DNS name assigned to this node.
 	Name          string
 	Addresses     []netaddr.IPPrefix // same as tailcfg.Node.Addresses (IP addresses of this Node directly)
-	LocalPort     uint16             // used for debugging
 	MachineStatus tailcfg.MachineStatus
 	MachineKey    key.MachinePublic
 	Peers         []*tailcfg.Node // sorted by Node.ID
@@ -122,6 +121,16 @@ func (nm *NetworkMap) VeryConcise() string {
 	return buf.String()
 }
 
+// PeerWithStableID finds and returns the peer associated to the inputted StableNodeID.
+func (nm *NetworkMap) PeerWithStableID(pid tailcfg.StableNodeID) (_ *tailcfg.Node, ok bool) {
+	for _, p := range nm.Peers {
+		if p.StableID == pid {
+			return p, true
+		}
+	}
+	return nil, false
+}
+
 // printConciseHeader prints a concise header line representing nm to buf.
 //
 // If this function is changed to access different fields of nm, keep
@@ -138,9 +147,6 @@ func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 		}
 	}
 	fmt.Fprintf(buf, " u=%s", login)
-	if nm.LocalPort != 0 {
-		fmt.Fprintf(buf, " port=%v", nm.LocalPort)
-	}
 	if nm.Debug != nil {
 		j, _ := json.Marshal(nm.Debug)
 		fmt.Fprintf(buf, " debug=%s", j)
@@ -154,7 +160,6 @@ func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 func (a *NetworkMap) equalConciseHeader(b *NetworkMap) bool {
 	if a.NodeKey != b.NodeKey ||
 		a.MachineStatus != b.MachineStatus ||
-		a.LocalPort != b.LocalPort ||
 		a.User != b.User ||
 		len(a.Addresses) != len(b.Addresses) {
 		return false

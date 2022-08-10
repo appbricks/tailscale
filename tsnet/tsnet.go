@@ -10,6 +10,7 @@ package tsnet
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -29,6 +30,9 @@ import (
 	"tailscale.com/ipn/localapi"
 	"tailscale.com/ipn/store"
 	"tailscale.com/ipn/store/mem"
+	"tailscale.com/logpolicy"
+	"tailscale.com/logtail"
+	"tailscale.com/logtail/filch"
 	"tailscale.com/net/nettest"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/smallzstd"
@@ -52,6 +56,10 @@ type Server struct {
 	//
 	// If nil, a new FileStore is initialized at `Dir/tailscaled.state`.
 	// See tailscale.com/ipn/store for supported stores.
+	//
+	// Logs will automatically be uploaded to uploaded to log.tailscale.io,
+	// where the configuration file for logging will be saved at
+	// `Dir/tailscaled.log.conf`.
 	Store ipn.StateStore
 
 	// Hostname is the hostname to present to the control server.
@@ -66,6 +74,13 @@ type Server struct {
 	// as an Ephemeral node (https://tailscale.com/kb/1111/ephemeral-nodes/).
 	Ephemeral bool
 
+	// AuthKey, if non-empty, is the auth key to create the node
+	// and will be preferred over the TS_AUTHKEY environment
+	// variable. If the node is already created (from state
+	// previously stored in in Store), then this field is not
+	// used.
+	AuthKey string
+
 	initOnce         sync.Once
 	initErr          error
 	lb               *ipnlocal.LocalBackend
@@ -76,6 +91,7 @@ type Server struct {
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
 	localClient      *tailscale.LocalClient
+	logtail          *logtail.Logger
 
 	mu        sync.Mutex
 	listeners map[listenKey]*listener
@@ -127,6 +143,11 @@ func (s *Server) Close() error {
 	}
 	s.listeners = nil
 
+	// Perform a best-effort final flush.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.logtail.Shutdown(ctx)
+
 	return nil
 }
 
@@ -135,6 +156,13 @@ func (s *Server) doInit() {
 	if err := s.start(); err != nil {
 		s.initErr = fmt.Errorf("tsnet: %w", err)
 	}
+}
+
+func (s *Server) getAuthKey() string {
+	if v := s.AuthKey; v != "" {
+		return v
+	}
+	return os.Getenv("TS_AUTHKEY")
 }
 
 func (s *Server) start() error {
@@ -178,8 +206,42 @@ func (s *Server) start() error {
 		return fmt.Errorf("%v is not a directory", s.rootPath)
 	}
 
-	// TODO(bradfitz): start logtail? don't use filch, perhaps?
-	// only upload plumbed Logf?
+	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
+
+	lpc, err := logpolicy.ConfigFromFile(cfgPath)
+	switch {
+	case os.IsNotExist(err):
+		lpc = logpolicy.NewConfig(logtail.CollectionNode)
+		if err := lpc.Save(cfgPath); err != nil {
+			return fmt.Errorf("logpolicy.Config.Save for %v: %w", cfgPath, err)
+		}
+	case err != nil:
+		return fmt.Errorf("logpolicy.LoadConfig for %v: %w", cfgPath, err)
+	}
+	if err := lpc.Validate(logtail.CollectionNode); err != nil {
+		return fmt.Errorf("logpolicy.Config.Validate for %v: %w", cfgPath, err)
+	}
+	logid := lpc.PublicID.String()
+
+	f, err := filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
+	if err != nil {
+		return fmt.Errorf("error creating filch: %w", err)
+	}
+	c := logtail.Config{
+		Collection: lpc.Collection,
+		PrivateID:  lpc.PrivateID,
+		Stderr:     ioutil.Discard, // log everything to Buffer
+		Buffer:     f,
+		NewZstdEncoder: func() logtail.Encoder {
+			w, err := smallzstd.NewEncoder(nil)
+			if err != nil {
+				panic(err)
+			}
+			return w
+		},
+		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)},
+	}
+	s.logtail = logtail.NewLogger(c, logf)
 
 	s.linkMon, err = monitor.New(logf)
 	if err != nil {
@@ -226,7 +288,6 @@ func (s *Server) start() error {
 			return err
 		}
 	}
-	logid := "tsnet-TODO" // https://github.com/tailscale/tailscale/issues/3866
 
 	loginFlags := controlclient.LoginDefault
 	if s.Ephemeral {
@@ -245,7 +306,7 @@ func (s *Server) start() error {
 	prefs := ipn.NewPrefs()
 	prefs.Hostname = s.hostname
 	prefs.WantRunning = true
-	authKey := os.Getenv("TS_AUTHKEY")
+	authKey := s.getAuthKey()
 	err = lb.Start(ipn.Options{
 		StateKey:    ipn.GlobalDaemonStateKey,
 		UpdatePrefs: prefs,
@@ -259,7 +320,7 @@ func (s *Server) start() error {
 		logf("LocalBackend state is %v; running StartLoginInteractive...", st)
 		s.lb.StartLoginInteractive()
 	} else if authKey != "" {
-		logf("TS_AUTHKEY is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
+		logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
 	}
 	go s.printAuthURLLoop()
 
@@ -283,6 +344,9 @@ func (s *Server) start() error {
 }
 
 func (s *Server) logf(format string, a ...interface{}) {
+	if s.logtail != nil {
+		s.logtail.Logf(format, a...)
+	}
 	if s.Logf != nil {
 		s.Logf(format, a...)
 		return

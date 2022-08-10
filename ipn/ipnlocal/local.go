@@ -138,8 +138,9 @@ type LocalBackend struct {
 	sshServer      SSHServer    // or nil, initialized lazily.
 	notify         func(ipn.Notify)
 	cc             controlclient.Client
-	stateKey       ipn.StateKey // computed in part from user-provided value
-	userID         string       // current controlling user ID (for Windows, primarily)
+	ccAuto         *controlclient.Auto // if cc is of type *controlclient.Auto
+	stateKey       ipn.StateKey        // computed in part from user-provided value
+	userID         string              // current controlling user ID (for Windows, primarily)
 	prefs          *ipn.Prefs
 	inServerMode   bool
 	machinePrivKey key.MachinePrivate
@@ -416,6 +417,9 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 				s.Health = append(s.Health, err.Error())
 			}
 		}
+		if m := b.sshOnButUnusableHealthCheckMessageLocked(); m != "" {
+			s.Health = append(s.Health, m)
+		}
 		if b.netMap != nil {
 			s.CertDomains = append([]string(nil), b.netMap.DNS.CertDomains...)
 			s.MagicDNSSuffix = b.netMap.MagicDNSSuffix()
@@ -425,6 +429,20 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 			s.CurrentTailnet.MagicDNSSuffix = b.netMap.MagicDNSSuffix()
 			s.CurrentTailnet.MagicDNSEnabled = b.netMap.DNS.Proxied
 			s.CurrentTailnet.Name = b.netMap.Domain
+			if b.prefs != nil && !b.prefs.ExitNodeID.IsZero() {
+				if exitPeer, ok := b.netMap.PeerWithStableID(b.prefs.ExitNodeID); ok {
+					var online = false
+					if exitPeer.Online != nil {
+						online = *exitPeer.Online
+					}
+					s.ExitNodeStatus = &ipnstate.ExitNodeStatus{
+						ID:           b.prefs.ExitNodeID,
+						Online:       online,
+						TailscaleIPs: exitPeer.Addresses,
+					}
+				}
+
+			}
 		}
 	})
 	sb.MutateSelfStatus(func(ss *ipnstate.PeerStatus) {
@@ -779,7 +797,7 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 
 	if cc != nil {
 		if needUpdateEndpoints {
-			cc.UpdateEndpoints(0, s.LocalAddrs)
+			cc.UpdateEndpoints(s.LocalAddrs)
 		}
 		b.stateMachine()
 	}
@@ -1038,6 +1056,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		Pinger:               b,
 		PopBrowserURL:        b.tellClientToBrowseToURL,
 		Dialer:               b.Dialer(),
+		Status:               b.setClientStatus,
 
 		// Don't warn about broken Linux IP forwarding when
 		// netstack is being used.
@@ -1049,14 +1068,14 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 
 	b.mu.Lock()
 	b.cc = cc
+	b.ccAuto, _ = cc.(*controlclient.Auto)
 	endpoints := b.endpoints
 	b.mu.Unlock()
 
 	if endpoints != nil {
-		cc.UpdateEndpoints(0, endpoints)
+		cc.UpdateEndpoints(endpoints)
 	}
 
-	cc.SetStatusFunc(b.setClientStatus)
 	b.e.SetNetInfoCallback(b.setNetInfo)
 
 	b.mu.Lock()
@@ -1826,37 +1845,86 @@ func (b *LocalBackend) CheckPrefs(p *ipn.Prefs) error {
 }
 
 func (b *LocalBackend) checkPrefsLocked(p *ipn.Prefs) error {
+	var errs []error
 	if p.Hostname == "badhostname.tailscale." {
 		// Keep this one just for testing.
-		return errors.New("bad hostname [test]")
+		errs = append(errs, errors.New("bad hostname [test]"))
 	}
-	if p.RunSSH {
-		switch runtime.GOOS {
-		case "linux":
-			if distro.Get() == distro.Synology && !envknob.UseWIPCode() {
-				return errors.New("The Tailscale SSH server does not run on Synology.")
-			}
-			// otherwise okay
-		case "darwin":
-			// okay only in tailscaled mode for now.
-			if version.IsSandboxedMacOS() {
-				return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
-			}
-			if !envknob.UseWIPCode() {
-				return errors.New("The Tailscale SSH server is disabled on macOS tailscaled by default. To try, set env TAILSCALE_USE_WIP_CODE=1")
-			}
-		default:
-			return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
+	if err := b.checkSSHPrefsLocked(p); err != nil {
+		errs = append(errs, err)
+	}
+	return multierr.New(errs...)
+}
+
+func (b *LocalBackend) checkSSHPrefsLocked(p *ipn.Prefs) error {
+	if !p.RunSSH {
+		return nil
+	}
+	switch runtime.GOOS {
+	case "linux":
+		if distro.Get() == distro.Synology && !envknob.UseWIPCode() {
+			return errors.New("The Tailscale SSH server does not run on Synology.")
 		}
-		if !canSSH {
-			return errors.New("The Tailscale SSH server has been administratively disabled.")
+		// otherwise okay
+	case "darwin":
+		// okay only in tailscaled mode for now.
+		if version.IsSandboxedMacOS() {
+			return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
 		}
-		if b.netMap != nil && b.netMap.SSHPolicy == nil &&
-			envknob.SSHPolicyFile() == "" && !envknob.SSHIgnoreTailnetPolicy() {
-			return errors.New("Unable to enable local Tailscale SSH server; not enabled/configured on Tailnet.")
+		if !envknob.UseWIPCode() {
+			return errors.New("The Tailscale SSH server is disabled on macOS tailscaled by default. To try, set env TAILSCALE_USE_WIP_CODE=1")
+		}
+	default:
+		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
+	}
+	if !canSSH {
+		return errors.New("The Tailscale SSH server has been administratively disabled.")
+	}
+	if envknob.SSHIgnoreTailnetPolicy() || envknob.SSHPolicyFile() != "" {
+		return nil
+	}
+	if b.netMap != nil {
+		if !hasCapability(b.netMap, tailcfg.CapabilitySSH) {
+			if b.isDefaultServerLocked() {
+				return errors.New("Unable to enable local Tailscale SSH server; not enabled on Tailnet. See https://tailscale.com/s/ssh")
+			}
+			return errors.New("Unable to enable local Tailscale SSH server; not enabled on Tailnet.")
 		}
 	}
 	return nil
+}
+
+func (b *LocalBackend) sshOnButUnusableHealthCheckMessageLocked() (healthMessage string) {
+	if b.prefs == nil || !b.prefs.RunSSH {
+		return ""
+	}
+	if envknob.SSHIgnoreTailnetPolicy() || envknob.SSHPolicyFile() != "" {
+		return "development SSH policy in use"
+	}
+	nm := b.netMap
+	if nm == nil {
+		return ""
+	}
+	if nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0 {
+		return ""
+	}
+	isDefault := b.isDefaultServerLocked()
+	isAdmin := hasCapability(nm, tailcfg.CapabilityAdmin)
+
+	if !isAdmin {
+		return "Tailscale SSH enabled, but access controls don't allow anyone to access this device. Ask your admin to update your tailnet's ACLs to allow access."
+	}
+	if !isDefault {
+		return "Tailscale SSH enabled, but access controls don't allow anyone to access this device. Update your tailnet's ACLs to allow access."
+	}
+	return "Tailscale SSH enabled, but access controls don't allow anyone to access this device. Update your tailnet's ACLs at https://tailscale.com/s/ssh-policy"
+}
+
+func (b *LocalBackend) isDefaultServerLocked() bool {
+	if b.prefs == nil {
+		return true // assume true until set otherwise
+	}
+	return b.prefs.ControlURLOrDefault() == ipn.DefaultControlURL
 }
 
 func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (*ipn.Prefs, error) {
@@ -2107,7 +2175,6 @@ func (b *LocalBackend) authReconfig() {
 	nm := b.netMap
 	hasPAC := b.prevIfState.HasPAC()
 	disableSubnetsIfPAC := nm != nil && nm.Debug != nil && nm.Debug.DisableSubnetsIfPAC.EqualBool(true)
-	oneCGNATRoute := nm != nil && nm.Debug != nil && nm.Debug.OneCGNATRoute.EqualBool(true)
 	b.mu.Unlock()
 
 	if blocked {
@@ -2152,6 +2219,7 @@ func (b *LocalBackend) authReconfig() {
 		return
 	}
 
+	oneCGNATRoute := shouldUseOneCGNATRoute(nm, b.logf, version.OS())
 	rcfg := b.routerConfig(cfg, prefs, oneCGNATRoute)
 	dcfg := dnsConfigForNetmap(nm, prefs, b.logf, version.OS())
 
@@ -2164,8 +2232,40 @@ func (b *LocalBackend) authReconfig() {
 	b.initPeerAPIListener()
 }
 
+// shouldUseOneCGNATRoute reports whether we should prefer to make one big
+// CGNAT /10 route rather than a /32 per peer.
+//
+// The versionOS is a Tailscale-style version ("iOS", "macOS") and not
+// a runtime.GOOS.
+func shouldUseOneCGNATRoute(nm *netmap.NetworkMap, logf logger.Logf, versionOS string) bool {
+	// Explicit enabling or disabling always take precedence.
+	if nm.Debug != nil {
+		if v, ok := nm.Debug.OneCGNATRoute.Get(); ok {
+			logf("[v1] shouldUseOneCGNATRoute: explicit=%v", v)
+			return v
+		}
+	}
+	// Also prefer to do this on the Mac, so that we don't need to constantly
+	// update the network extension configuration (which is disruptive to
+	// Chrome, see https://github.com/tailscale/tailscale/issues/3102). Only
+	// use fine-grained routes if another interfaces is also using the CGNAT
+	// IP range.
+	if versionOS == "macOS" {
+		hasCGNATInterface, err := interfaces.HasCGNATInterface()
+		if err != nil {
+			logf("shouldUseOneCGNATRoute: Could not determine if any interfaces use CGNAT: %v", err)
+			return false
+		}
+		logf("[v1] shouldUseOneCGNATRoute: macOS automatic=%v", !hasCGNATInterface)
+		if !hasCGNATInterface {
+			return true
+		}
+	}
+	return false
+}
+
 // dnsConfigForNetmap returns a *dns.Config for the given netmap,
-// prefs, and client OS version.
+// prefs, client OS version, and cloud hosting environment.
 //
 // The versionOS is a Tailscale-style version ("iOS", "macOS") and not
 // a runtime.GOOS.
@@ -2267,7 +2367,6 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs *ipn.Prefs, logf logger.Log
 
 	addDefault := func(resolvers []*dnstype.Resolver) {
 		for _, r := range resolvers {
-			r := r
 			dcfg.DefaultResolvers = append(dcfg.DefaultResolvers, r)
 		}
 	}
@@ -3107,7 +3206,7 @@ func (b *LocalBackend) FileTargets() ([]*apitype.FileTarget, error) {
 	defer b.mu.Unlock()
 	nm := b.netMap
 	if b.state != ipn.Running || nm == nil {
-		return nil, errors.New("not connected")
+		return nil, errors.New("not connected to the tailnet")
 	}
 	if !b.capFileSharing {
 		return nil, errors.New("file sharing not enabled by Tailscale admin")
@@ -3146,7 +3245,7 @@ func (b *LocalBackend) SetDNS(ctx context.Context, name, value string) error {
 	}
 
 	b.mu.Lock()
-	cc := b.cc
+	cc := b.ccAuto
 	if prefs := b.prefs; prefs != nil {
 		req.NodeKey = prefs.Persist.PrivateNodeKey.Public()
 	}
@@ -3314,7 +3413,13 @@ func (b *LocalBackend) allowExitNodeDNSProxyToServeName(name string) bool {
 // If t is in the past, the key is expired immediately.
 // If t is after the current expiry, an error is returned.
 func (b *LocalBackend) SetExpirySooner(ctx context.Context, expiry time.Time) error {
-	return b.cc.SetExpirySooner(ctx, expiry)
+	b.mu.Lock()
+	cc := b.ccAuto
+	b.mu.Unlock()
+	if cc == nil {
+		return errors.New("not running")
+	}
+	return cc.SetExpirySooner(ctx, expiry)
 }
 
 // exitNodeCanProxyDNS reports the DoH base URL ("http://foo/dns-query") without query parameters
@@ -3374,7 +3479,7 @@ func (b *LocalBackend) magicConn() (*magicsock.Conn, error) {
 // Noise connection.
 func (b *LocalBackend) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 	b.mu.Lock()
-	cc := b.cc
+	cc := b.ccAuto
 	b.mu.Unlock()
 	if cc == nil {
 		return nil, errors.New("no client")

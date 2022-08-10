@@ -362,7 +362,7 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 // without changing any settings.
 func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, justEditMP *ipn.MaskedPrefs, err error) {
 	if !env.upArgs.reset {
-		applyImplicitPrefs(prefs, curPrefs, env.user)
+		applyImplicitPrefs(prefs, curPrefs, env)
 
 		if err := checkForAccidentalSettingReverts(prefs, curPrefs, env); err != nil {
 			return false, nil, err
@@ -404,7 +404,7 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 	return simpleUp, justEditMP, nil
 }
 
-func runUp(ctx context.Context, args []string) error {
+func runUp(ctx context.Context, args []string) (retErr error) {
 	if len(args) > 0 {
 		fatalf("too many non-flag arguments: %q", args)
 	}
@@ -480,6 +480,12 @@ func runUp(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+
+	defer func() {
+		if retErr == nil {
+			checkSSHUpWarnings(ctx)
+		}
+	}()
 
 	simpleUp, justEditMP, err := updatePrefs(prefs, curPrefs, env)
 	if err != nil {
@@ -676,6 +682,28 @@ func runUp(ctx context.Context, args []string) error {
 	}
 }
 
+func checkSSHUpWarnings(ctx context.Context) {
+	if !upArgs.runSSH {
+		return
+	}
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		// Ignore. Don't spam more.
+		return
+	}
+	if len(st.Health) == 0 {
+		return
+	}
+	if len(st.Health) == 1 && strings.Contains(st.Health[0], "SSH") {
+		printf("%s\n", st.Health[0])
+		return
+	}
+	printf("# Health check:\n")
+	for _, m := range st.Health {
+		printf("    - %s\n", m)
+	}
+}
+
 func printUpDoneJSON(state ipn.State, errorString string) {
 	js := &upOutputJSON{BackendState: state.String(), Error: errorString}
 	data, err := json.MarshalIndent(js, "", "  ")
@@ -853,13 +881,20 @@ func checkForAccidentalSettingReverts(newPrefs, curPrefs *ipn.Prefs, env upCheck
 	return errors.New(sb.String())
 }
 
-// applyImplicitPrefs mutates prefs to add implicit preferences. Currently
-// this is just the operator user, which only needs to be set if it doesn't
+// applyImplicitPrefs mutates prefs to add implicit preferences for the user operator.
+// If the operator flag is passed no action is taken, otherwise this only needs to be set if it doesn't
 // match the current user.
 //
 // curUser is os.Getenv("USER"). It's pulled out for testability.
-func applyImplicitPrefs(prefs, oldPrefs *ipn.Prefs, curUser string) {
-	if prefs.OperatorUser == "" && oldPrefs.OperatorUser == curUser {
+func applyImplicitPrefs(prefs, oldPrefs *ipn.Prefs, env upCheckEnv) {
+	explicitOperator := false
+	env.flagSet.Visit(func(f *flag.Flag) {
+		if f.Name == "operator" {
+			explicitOperator = true
+		}
+	})
+
+	if prefs.OperatorUser == "" && oldPrefs.OperatorUser == env.user && !explicitOperator {
 		prefs.OperatorUser = oldPrefs.OperatorUser
 	}
 }

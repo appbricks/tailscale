@@ -76,11 +76,12 @@ func TestStdHandler(t *testing.T) {
 	// cancel()
 
 	tests := []struct {
-		name     string
-		rh       ReturnHandler
-		r        *http.Request
-		wantCode int
-		wantLog  AccessLogRecord
+		name       string
+		rh         ReturnHandler
+		r          *http.Request
+		errHandler ErrorHandlerFunc
+		wantCode   int
+		wantLog    AccessLogRecord
 	}{
 		{
 			name:     "handler returns 200",
@@ -238,6 +239,26 @@ func TestStdHandler(t *testing.T) {
 				Code:       101,
 			},
 		},
+		{
+			name:     "error handler gets run",
+			rh:       handlerErr(0, Error(404, "not found", nil)), // status code changed in errHandler
+			r:        req(bgCtx, "http://example.com/"),
+			wantCode: 200,
+			errHandler: func(w http.ResponseWriter, r *http.Request, e HTTPError) {
+				http.Error(w, e.Msg, 200)
+			},
+			wantLog: AccessLogRecord{
+				When:       clock.Start,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				TLS:        false,
+				Host:       "example.com",
+				Method:     "GET",
+				Code:       404,
+				Err:        "not found",
+				RequestURI: "/",
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -253,7 +274,7 @@ func TestStdHandler(t *testing.T) {
 			clock.Reset()
 
 			rec := noopHijacker{httptest.NewRecorder(), false}
-			h := StdHandler(test.rh, HandlerOptions{Logf: logf, Now: clock.Now})
+			h := StdHandler(test.rh, HandlerOptions{Logf: logf, Now: clock.Now, OnError: test.errHandler})
 			h.ServeHTTP(&rec, test.r)
 			res := rec.Result()
 			if res.StatusCode != test.wantCode {
@@ -313,6 +334,9 @@ func TestVarzHandler(t *testing.T) {
 		t.Logf("Got: %s", rec.Body.Bytes())
 	})
 
+	half := new(expvar.Float)
+	half.Set(0.5)
+
 	tests := []struct {
 		name string
 		k    string // key name
@@ -336,6 +360,31 @@ func TestVarzHandler(t *testing.T) {
 			"gauge_foo",
 			new(expvar.Int),
 			"# TYPE foo gauge\nfoo 0\n",
+		},
+		{
+			// For a float = 0.0, Prometheus client_golang outputs "0"
+			"float_zero",
+			"foo",
+			new(expvar.Float),
+			"# TYPE foo gauge\nfoo 0\n",
+		},
+		{
+			"float_point_5",
+			"foo",
+			half,
+			"# TYPE foo gauge\nfoo 0.5\n",
+		},
+		{
+			"float_with_type_counter",
+			"counter_foo",
+			half,
+			"# TYPE foo counter\nfoo 0.5\n",
+		},
+		{
+			"float_with_type_gauge",
+			"gauge_foo",
+			half,
+			"# TYPE foo gauge\nfoo 0.5\n",
 		},
 		{
 			"metrics_set",

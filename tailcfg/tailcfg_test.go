@@ -32,7 +32,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"ShieldsUp", "ShareeNode",
 		"GoArch",
 		"RoutableIPs", "RequestTags",
-		"Services", "NetInfo", "SSH_HostKeys",
+		"Services", "NetInfo", "SSH_HostKeys", "Cloud",
 	}
 	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -267,6 +267,33 @@ func TestHostinfoHowEqual(t *testing.T) {
 		got := tt.a.HowUnequal(tt.b)
 		if !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("%d. got %q; want %q", i, got, tt.want)
+		}
+	}
+}
+
+func TestHostinfoTailscaleSSHEnabled(t *testing.T) {
+	tests := []struct {
+		hi   *Hostinfo
+		want bool
+	}{
+		{
+			nil,
+			false,
+		},
+		{
+			&Hostinfo{},
+			false,
+		},
+		{
+			&Hostinfo{SSH_HostKeys: []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO.... root@bar"}},
+			true,
+		},
+	}
+
+	for i, tt := range tests {
+		got := tt.hi.TailscaleSSHEnabled()
+		if got != tt.want {
+			t.Errorf("%d. got %v; want %v", i, got, tt.want)
 		}
 	}
 }

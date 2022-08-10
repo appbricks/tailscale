@@ -19,9 +19,10 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
 	"inet.af/netaddr"
 	"tailscale.com/envknob"
+	"tailscale.com/util/cloudenv"
+	"tailscale.com/util/singleflight"
 )
 
 var single = &Resolver{
@@ -81,10 +82,16 @@ type Resolver struct {
 	// It is required when SingleHostStaticResult is present.
 	SingleHost string
 
-	sf singleflight.Group
+	sf singleflight.Group[string, ipRes]
 
 	mu      sync.Mutex
 	ipCache map[string]ipCacheEntry
+}
+
+// ipRes is the type used by the Resolver.sf singleflight group.
+type ipRes struct {
+	ip, ip6 net.IP
+	allIPs  []net.IPAddr
 }
 
 type ipCacheEntry struct {
@@ -99,6 +106,30 @@ func (r *Resolver) fwd() *net.Resolver {
 		return r.Forward
 	}
 	return net.DefaultResolver
+}
+
+// cloudHostResolver returns a Resolver for the current cloud hosting environment.
+// It currently only supports Google Cloud.
+func (r *Resolver) cloudHostResolver() (v *net.Resolver, ok bool) {
+	switch runtime.GOOS {
+	case "android", "ios", "darwin":
+		return nil, false
+	case "windows":
+		// TODO(bradfitz): remove this restriction once we're using Go 1.19
+		// which supports net.Resolver.PreferGo on Windows.
+		return nil, false
+	}
+	ip := cloudenv.Get().ResolverIP()
+	if ip == "" {
+		return nil, false
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, net.JoinHostPort(ip, "53"))
+		},
+	}, true
 }
 
 func (r *Resolver) ttl() time.Duration {
@@ -150,14 +181,10 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 net.IP, al
 		return ip, ip6, allIPs, nil
 	}
 
-	type ipRes struct {
-		ip, ip6 net.IP
-		allIPs  []net.IPAddr
-	}
-	ch := r.sf.DoChan(host, func() (any, error) {
+	ch := r.sf.DoChan(host, func() (ret ipRes, _ error) {
 		ip, ip6, allIPs, err := r.lookupIP(host)
 		if err != nil {
-			return nil, err
+			return ret, err
 		}
 		return ipRes{ip, ip6, allIPs}, nil
 	})
@@ -177,7 +204,7 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 net.IP, al
 			}
 			return nil, nil, nil, res.Err
 		}
-		r := res.Val.(ipRes)
+		r := res.Val
 		return r.ip, r.ip6, r.allIPs, nil
 	case <-ctx.Done():
 		if debug {
@@ -233,6 +260,11 @@ func (r *Resolver) lookupIP(host string) (ip, ip6 net.IP, allIPs []net.IPAddr, e
 	ctx, cancel := context.WithTimeout(context.Background(), r.lookupTimeoutForHost(host))
 	defer cancel()
 	ips, err := r.fwd().LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		if resolver, ok := r.cloudHostResolver(); ok {
+			ips, err = resolver.LookupIPAddr(ctx, host)
+		}
+	}
 	if (err != nil || len(ips) == 0) && r.LookupIPFallback != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
