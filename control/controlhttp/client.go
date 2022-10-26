@@ -220,7 +220,7 @@ func (a *dialParams) tryURLUpgrade(ctx context.Context, u *url.URL, init []byte)
 		} else {
 			url = fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 		}
-		if err := controlbase.MyCSHook.ConfigureHTTPClient(url, tr); err != nil {
+		if err := controlbase.MyCSHook.ConfigureHTTPTransport(url, tr); err != nil {
 			return nil, err
 		}
 	}

@@ -198,7 +198,7 @@ func NewDirect(opts Options) (*Direct, error) {
 
 		// *** MyCS Hook ***
 		if controlbase.MyCSHook != nil {
-			if err = controlbase.MyCSHook.ConfigureHTTPClient(opts.ServerURL, httpc); err != nil {
+			if err = controlbase.MyCSHook.ConfigureHTTPTransport(opts.ServerURL, tr); err != nil {
 				return nil, err
 			}
 		} else {
