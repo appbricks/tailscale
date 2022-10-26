@@ -211,6 +211,21 @@ func (a *dialParams) tryURLUpgrade(ctx context.Context, u *url.URL, init []byte)
 	tr.DialTLSContext = dnscache.TLSDialer(a.dialer, dns, tr.TLSClientConfig)
 	tr.DisableCompression = true
 
+	// *** MyCS Hook ***
+	if controlbase.MyCSHook != nil {
+		p := u.Port()
+		var url string
+		if p == "80" || p == "443" {
+			url = fmt.Sprintf("%s://%s", u.Scheme, u.Hostname())
+		} else {
+			url = fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+		}
+		if err := controlbase.MyCSHook.ConfigureHTTPClient(url, tr); err != nil {
+			return nil, err
+		}
+	}
+	// *****************
+	
 	// (mis)use httptrace to extract the underlying net.Conn from the
 	// transport. We make exactly 1 request using this transport, so
 	// there will be exactly 1 GotConn call. Additionally, the

@@ -507,7 +507,7 @@ func runUp(ctx context.Context, args []string) (retErr error) {
 	pumpErr := make(chan error, 1)
 	go func() { pumpErr <- pump(pumpCtx, bc, c) }()
 
-	var printed bool // whether we've yet printed anything to stdout or stderr
+	var printed bool = true // whether we've yet printed anything to stdout or stderr - *** MyCS default to true as output is captured
 	var loginOnce sync.Once
 	startLoginInteractive := func() { loginOnce.Do(func() { bc.StartLoginInteractive() }) }
 
