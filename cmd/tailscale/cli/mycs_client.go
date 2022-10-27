@@ -79,6 +79,9 @@ func RunPing(
 		if st, err = localClient.Status(cctx); err != nil {
 			break FINDPEER
 		}
+		if st.Self.HostName == name {
+			break FINDPEER
+		}
 		for _, peer = range st.Peer {
 			if peer.HostName == name {
 				break FINDPEER
