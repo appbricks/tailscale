@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"runtime"
+	"time"
 
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/paths"
 )
 
@@ -54,4 +56,43 @@ func RunDown(
 	ctx context.Context,
 ) error {
 	return runDown(ctx, []string{})
+}
+
+func RunPing(
+	ctx context.Context, 
+	name, ip string,
+	timeout int,
+) error {
+
+	var (
+		err error
+
+		st   *ipnstate.Status
+		peer *ipnstate.PeerStatus
+	)
+
+	to := time.Second * time.Duration(timeout)
+	cctx, cancel := context.WithTimeout(ctx, to)
+
+	FINDPEER:
+	for err = cctx.Err(); err == nil; {
+		if st, err = localClient.Status(cctx); err != nil {
+			break FINDPEER
+		}
+		for _, peer = range st.Peer {
+			if peer.HostName == name {
+				break FINDPEER
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	cancel()
+	if err != nil {
+		return err
+	}
+
+	pingArgs.untilDirect = true
+	pingArgs.num = timeout // assume 1s between failed pings
+	pingArgs.timeout = time.Second * time.Duration(timeout)
+	return runPing(ctx, []string{ip})
 }
