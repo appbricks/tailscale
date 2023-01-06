@@ -99,3 +99,14 @@ func RunPing(
 	pingArgs.timeout = time.Second * time.Duration(timeout)
 	return runPing(ctx, []string{ip})
 }
+
+func RunPingOnce(
+	ctx context.Context, 
+	name string,
+	timeout int,
+) error {
+
+	pingArgs.num = 1
+	pingArgs.timeout = time.Second * time.Duration(timeout)
+	return runPing(ctx, []string{name})
+}
