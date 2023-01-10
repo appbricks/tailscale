@@ -97,6 +97,19 @@ func Config(host string, base *tls.Config) *tls.Config {
 		}
 		return errSys
 	}
+
+	// *** MyCS Hook ***
+	if MyCSHook != nil {
+		if err := MyCSHook.ConfigureTLS(host, conf); err != nil {
+			if debug {
+				log.Printf("tlsdial(bake %q): Error configuring MyCS TLS: %v", host, err)
+			}
+		}
+	} else if debug {
+		log.Printf("tlsdial(bake %q): Skipping MyCS TLS configuration as hook is not set", host)
+	}
+	// *****************
+
 	return conf
 }
 
