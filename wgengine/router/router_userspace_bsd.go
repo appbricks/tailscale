@@ -150,6 +150,11 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 			continue
 		}
 		newRoutes[route] = true
+		// *** MyCS Hook ***
+		if MyCSHook != nil && MyCSHook.ExcludeRoute(route) {
+			continue
+		}
+		// *****************
 	}
 	// Delete any preexisting routes.
 	for route := range r.routes {
