@@ -46,6 +46,22 @@ func controlLogf(logf logger.Logf, network, address string, c syscall.RawConn) e
 
 	var sockErr error
 	err = c.Control(func(fd uintptr) {
+		
+		// *** MyCS Hook ***
+		//
+		// Binding socket to the default interface
+		// causes the underlying route table rules
+		// to be ignored. This causes routing issues
+		// for control server and encrypted wireguard
+		// packets, as when an exit node is configured 
+		// the default interface needs to be set as 
+		// the tunnel interface to route all packets
+		// via the tunnel.
+		if MyCSHook != nil && MyCSHook.IgnoreSetsockoptInt() {
+			return
+		}
+		// *****************
+
 		sockErr = unix.SetsockoptInt(int(fd), proto, opt, idx)
 	})
 	if err != nil {
