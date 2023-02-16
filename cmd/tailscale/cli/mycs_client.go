@@ -9,16 +9,17 @@ import (
 	"tailscale.com/paths"
 )
 
-func RunUp(
-	ctx context.Context, 
-	server string,
+func RunLogin(
+	ctx context.Context,
+	authKey string,
 	options map[string]interface{},
 ) error {
-	
+
 	rootArgs.socket = paths.DefaultTailscaledSocket()
+	
 	upArgs := upArgsT{}
-	upArgs.server = server
 	upArgs.forceReauth = true
+	upArgs.authKeyOrFile = authKey
 
 	switch runtime.GOOS {
 	case "linux":
@@ -30,12 +31,16 @@ func RunUp(
 
 	for k, v := range options {
 		switch k {
-		case "reset":
-			upArgs.reset = v.(bool)
-		case "authKey":
-			upArgs.authKeyOrFile = v.(string)
+		case "loginServer":
+			upArgs.server = v.(string)
 		case "hostname":
 			upArgs.hostname = v.(string)
+		case "reset":
+			upArgs.reset = v.(bool)
+		case "exitNodeIP":
+			upArgs.exitNodeIP = v.(string)
+		case "exitNodeAllowLANAccess":
+			upArgs.exitNodeAllowLANAccess = v.(bool)
 		case "acceptDNS":
 			upArgs.acceptDNS = v.(bool)
 		case "acceptRoutes":
@@ -44,11 +49,9 @@ func RunUp(
 			upArgs.advertiseRoutes = v.(string)
 		case "advertiseDefaultRoute":
 			upArgs.advertiseDefaultRoute = v.(bool)
-		case "exitNodeIP":
-			upArgs.exitNodeIP = v.(string)
 		}
 	}
-	return runUp(ctx, "up", []string{}, upArgs)
+	return runUp(ctx, "login", []string{}, upArgs)
 }
 
 func RunLogout(
@@ -66,7 +69,8 @@ func RunDown(
 func RunPing(
 	ctx context.Context, 
 	name, ip string,
-	timeout int,
+	direct bool,
+	numPings, timeout int,
 ) error {
 
 	var (
@@ -100,7 +104,7 @@ func RunPing(
 	}
 
 	pingArgs.untilDirect = true
-	pingArgs.num = timeout // assume 1s between failed pings
+	pingArgs.num = numPings
 	pingArgs.timeout = time.Second * time.Duration(timeout)
 	return runPing(ctx, []string{ip})
 }
