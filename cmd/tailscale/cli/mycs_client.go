@@ -103,7 +103,7 @@ func RunPing(
 		return err
 	}
 
-	pingArgs.untilDirect = true
+	pingArgs.untilDirect = direct
 	pingArgs.num = numPings
 	pingArgs.timeout = time.Second * time.Duration(timeout)
 	return runPing(ctx, []string{ip})
