@@ -1,7 +1,7 @@
 package wgengine
 
 import (
-	"golang.zx2c4.com/wireguard/device"
+	"github.com/tailscale/wireguard-go/device"
 )
 
 // retrieves the underlying wireguard device
