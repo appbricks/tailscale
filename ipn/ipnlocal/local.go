@@ -2981,6 +2981,13 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs ipn.PrefsView, logf logger.
 	for _, peer := range nm.Peers {
 		set(peer.Name, peer.Addresses)
 	}
+	// *** MyCS Hook ***
+	if MyCSHook != nil {
+		for _, n := range MyCSHook.ResolvedDNSNames() {
+			set(n.Name, n.Addrs)
+		}
+	}
+	// *****************
 	for _, rec := range nm.DNS.ExtraRecords {
 		switch rec.Type {
 		case "", "A", "AAAA":
@@ -3024,12 +3031,18 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs ipn.PrefsView, logf logger.
 		}
 	}
 
+	// **** MyCS - FIX **** 
+	// do not proxy DNS via exit node as we explicitly set it for the node.
+	// TODO: this could be handled by not running such unused services on 
+	// exit node.
+	// ********************
+
 	// If we're using an exit node and that exit node is new enough (1.19.x+)
 	// to run a DoH DNS proxy, then send all our DNS traffic through it.
-	if dohURL, ok := exitNodeCanProxyDNS(nm, prefs.ExitNodeID()); ok {
-		addDefault([]*dnstype.Resolver{{Addr: dohURL}})
-		return dcfg
-	}
+	// if dohURL, ok := exitNodeCanProxyDNS(nm, prefs.ExitNodeID); ok {
+	// 	addDefault([]*dnstype.Resolver{{Addr: dohURL}})
+	// 	return dcfg
+	// }
 
 	addDefault(nm.DNS.Resolvers)
 	for suffix, resolvers := range nm.DNS.Routes {

@@ -1,0 +1,121 @@
+package cli
+
+import (
+	"context"
+	"runtime"
+	"time"
+
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/paths"
+)
+
+func RunLogin(
+	ctx context.Context,
+	authKey string,
+	options map[string]interface{},
+) error {
+
+	rootArgs.socket = paths.DefaultTailscaledSocket()
+	
+	upArgs := upArgsT{}
+	upArgs.forceReauth = true
+	upArgs.authKeyOrFile = authKey
+
+	switch runtime.GOOS {
+	case "linux":
+		upArgs.snat = true
+		upArgs.netfilterMode = "on"
+	case "windows":
+		upArgs.forceDaemon = true
+	}
+
+	for k, v := range options {
+		switch k {
+		case "loginServer":
+			upArgs.server = v.(string)
+		case "hostname":
+			upArgs.hostname = v.(string)
+		case "reset":
+			upArgs.reset = v.(bool)
+		case "exitNodeIP":
+			upArgs.exitNodeIP = v.(string)
+		case "exitNodeAllowLANAccess":
+			upArgs.exitNodeAllowLANAccess = v.(bool)
+		case "acceptDNS":
+			upArgs.acceptDNS = v.(bool)
+		case "acceptRoutes":
+			upArgs.acceptRoutes = v.(bool)
+		case "advertiseRoutes":
+			upArgs.advertiseRoutes = v.(string)
+		case "advertiseDefaultRoute":
+			upArgs.advertiseDefaultRoute = v.(bool)
+		}
+	}
+	return runUp(ctx, "login", []string{}, upArgs)
+}
+
+func RunLogout(
+	ctx context.Context,
+) error {
+	return runLogout(ctx, []string{})
+}
+
+func RunDown(
+	ctx context.Context,
+) error {
+	return runDown(ctx, []string{})
+}
+
+func RunPing(
+	ctx context.Context, 
+	name, ip string,
+	direct bool,
+	numPings, timeout int,
+) error {
+
+	var (
+		err error
+
+		st   *ipnstate.Status
+		peer *ipnstate.PeerStatus
+	)
+
+	to := time.Second * time.Duration(timeout)
+	cctx, cancel := context.WithTimeout(ctx, to)
+
+	FINDPEER:
+	for err = cctx.Err(); err == nil; {
+		if st, err = localClient.Status(cctx); err != nil {
+			break FINDPEER
+		}
+		if st.Self.HostName == name {
+			break FINDPEER
+		}
+		for _, peer = range st.Peer {
+			if peer.HostName == name {
+				break FINDPEER
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	cancel()
+	if err != nil {
+		return err
+	}
+
+	pingArgs.untilDirect = direct
+	pingArgs.num = numPings
+	pingArgs.timeout = time.Second * time.Duration(timeout)
+	return runPing(ctx, []string{ip})
+}
+
+func RunPingOnce(
+	ctx context.Context, 
+	name string,
+	timeout int,
+) error {
+
+	pingArgs.num = 1
+	pingArgs.timeout = time.Second * time.Duration(timeout)
+	return runPing(ctx, []string{name})
+}

@@ -149,6 +149,13 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 			// implicitly. We mustn't try to add/delete it ourselves.
 			continue
 		}
+
+		// *** MyCS Hook ***
+		if MyCSHook != nil && MyCSHook.ExcludeRoute(route) {
+			continue
+		}
+		// *****************
+
 		newRoutes[route] = true
 	}
 	// Delete any preexisting routes.

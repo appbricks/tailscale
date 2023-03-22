@@ -46,7 +46,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
@@ -61,9 +60,11 @@ func getLogTarget() string {
 		if val, ok := os.LookupEnv("TS_LOG_TARGET"); ok {
 			getLogTargetOnce.v = val
 		} else {
-			if runtime.GOOS == "windows" {
-				getLogTargetOnce.v = winutil.GetRegString("LogTarget", "")
-			}
+			// **** MyCS Removed Code ****
+			// if runtime.GOOS == "windows" {
+			// 	getLogTargetOnce.v = winutil.GetRegString("LogTarget", "")
+			// }
+			// ***************************
 		}
 	})
 
@@ -471,7 +472,16 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 		// anyway, no need to add one.
 		lflags = 0
 	}
-	console := log.New(stderrWriter{}, "", lflags)
+	// **** MyCS Override ****
+	//
+	// console := log.New(stderrWriter{}, "", lflags)
+	var console *log.Logger
+	if MyCSLogOut != nil {
+		console = log.New(MyCSLogOut, "", lflags)
+	} else {
+		console = log.New(stderrWriter{}, "", lflags)
+	}
+	// ***********************
 
 	var earlyErrBuf bytes.Buffer
 	earlyLogf := func(format string, a ...any) {

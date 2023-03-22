@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -226,6 +227,16 @@ func NewDirect(opts Options) (*Direct, error) {
 		// zstd compression per naclbox.
 		tr.DisableCompression = true
 		httpc = &http.Client{Transport: tr}
+
+		// *** MyCS Hook ***
+		if controlbase.MyCSHook != nil {
+			if err = controlbase.MyCSHook.ConfigureHTTPTransport(opts.ServerURL, tr); err != nil {
+				return nil, err
+			}
+		} else {
+			opts.Logf("NewDirect(): Skipping MyCS configuration as hook is not set.")
+		}
+		// *****************
 	}
 
 	c := &Direct{

@@ -562,7 +562,7 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 	running := make(chan bool, 1) // gets value once in state ipn.Running
 	pumpErr := make(chan error, 1)
 
-	var printed bool // whether we've yet printed anything to stdout or stderr
+	var printed bool = true // whether we've yet printed anything to stdout or stderr - *** MyCS default to true as output is captured
 	var loginOnce sync.Once
 	startLoginInteractive := func() { loginOnce.Do(func() { localClient.StartLoginInteractive(ctx) }) }
 
